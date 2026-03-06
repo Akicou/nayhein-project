@@ -424,6 +424,8 @@ class DualModeModel(nn.Module):
                 # Shift for causal language modeling
                 shift_logits = ar_logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
+                # Clamp labels to vocab_size range
+                shift_labels = shift_labels.clamp(0, self.vocab_size - 1)
                 
                 loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
                 ar_loss = loss_fct(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1))
@@ -435,8 +437,10 @@ class DualModeModel(nn.Module):
             outputs["diffusion_logits"] = diffusion_logits
             
             if labels is not None:
+                # Clamp labels to vocab_size range
+                clamped_labels = labels.clamp(0, self.vocab_size - 1)
                 loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-                diffusion_loss = loss_fct(diffusion_logits.view(-1, self.vocab_size), labels.view(-1))
+                diffusion_loss = loss_fct(diffusion_logits.view(-1, self.vocab_size), clamped_labels.view(-1))
                 outputs["diffusion_loss"] = diffusion_loss
         
         if use_cache:
