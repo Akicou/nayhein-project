@@ -890,7 +890,6 @@ def main():
     parser.add_argument("--mlp-ratio", type=float, default=4.0, help="MLP expansion ratio")
     
     # Training options
-    parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing")
     parser.add_argument("--use-flash-attention", action="store_true", help="Enable Flash Attention 2 for long context (requires flash-attn package)")
     parser.add_argument("--mixed-precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"], help="Mixed precision")
     parser.add_argument("--accumulation-steps", type=int, default=1, help="Gradient accumulation steps")
