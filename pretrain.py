@@ -976,7 +976,7 @@ def main():
         tokenizer = get_default_tokenizer()
         
         train_dataset = UltraFineWebDataset(
-            split="train",
+            split="en",  # Ultra-FineWeb uses 'en' or 'zh' splits
             seq_len=config.max_seq_len,
             tokenizer=tokenizer,
         )
@@ -998,11 +998,11 @@ def main():
     
     val_loader = None
     if config.val_data_path:
-        if config.val_data_path == "ultra-fine-web":
-            # Use validation split from Ultra-FineWeb
+        if config.val_data_path == "ultra-fine-web" or config.val_data_path == "en":
+            # Use Chinese split for validation (different from English training)
             tokenizer = get_default_tokenizer()
             val_dataset = UltraFineWebDataset(
-                split="test",
+                split="zh",
                 seq_len=config.max_seq_len,
                 tokenizer=tokenizer,
             )
