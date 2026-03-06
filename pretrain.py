@@ -383,6 +383,9 @@ class DualModeModel(nn.Module):
         """
         batch_size, seq_len = input_ids.shape
         
+        # Clamp input_ids to vocab_size to avoid index out of bounds
+        input_ids = input_ids.clamp(0, self.vocab_size - 1)
+        
         # Embeddings - always wrap position_ids with modulo to handle any seq_len
         position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
         # Wrap position IDs using modulo (position embeddings are smaller than seq_len)
