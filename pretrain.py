@@ -224,6 +224,7 @@ class TransformerBlock(nn.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = head_dim
+        self.gradient_checkpointing = False
         
         # Pre-norm architecture
         self.input_layernorm = nn.LayerNorm(hidden_size, eps=1e-6)
@@ -286,7 +287,7 @@ class DualModeModel(nn.Module):
     
     def __init__(
         self,
-        vocab_size: int = 32000,
+        vocab_size: int = 16000,
         hidden_size: int = 512,
         num_layers: int = 10,
         num_heads: int = 8,
@@ -295,8 +296,10 @@ class DualModeModel(nn.Module):
         max_seq_len: int = 2048,
         use_cache: bool = False,
         use_flash_attn: bool = False,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
+        self.gradient_checkpointing = gradient_checkpointing
         
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -348,6 +351,12 @@ class DualModeModel(nn.Module):
         """Calculate total number of parameters."""
         return sum(p.numel() for p in self.parameters())
     
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for all layers."""
+        self.gradient_checkpointing = True
+        for layer in self.layers:
+            layer.gradient_checkpointing = True
+    
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -391,7 +400,13 @@ class DualModeModel(nn.Module):
         present = None
         for i, layer in enumerate(self.layers):
             past = past_key_values[i] if past_key_values is not None else None
-            hidden_states, present = layer(hidden_states, attention_mask, use_cache=use_cache, past_key_values=past)
+            # Apply gradient checkpointing to save memory
+            if self.gradient_checkpointing and layer.gradient_checkpointing:
+                hidden_states, present = torch.utils.checkpoint.checkpoint(
+                    layer, hidden_states, attention_mask, use_cache, past, use_reentrant=False
+                )
+            else:
+                hidden_states, present = layer(hidden_states, attention_mask, use_cache=use_cache, past_key_values=past)
         
         hidden_states = self.final_layernorm(hidden_states)
         
@@ -857,7 +872,8 @@ def main():
     
     # Training arguments
     parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size (smaller for long sequences)")
+    parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--warmup-steps", type=int, default=100, help="Warmup steps")
     parser.add_argument("--save-interval", type=int, default=1000, help="Save interval")
@@ -865,11 +881,11 @@ def main():
     parser.add_argument("--eval-interval", type=int, default=1000, help="Evaluation interval")
     parser.add_argument("--seq-len", type=int, default=512, help="Sequence length")
     
-    # Model arguments
-    parser.add_argument("--vocab-size", type=int, default=32000, help="Vocabulary size")
-    parser.add_argument("--hidden-size", type=int, default=512, help="Hidden size")
-    parser.add_argument("--num-layers", type=int, default=10, help="Number of layers")
-    parser.add_argument("--num-heads", type=int, default=8, help="Number of attention heads")
+    # Model arguments - defaults for ~10M model
+    parser.add_argument("--vocab-size", type=int, default=16000, help="Vocabulary size")
+    parser.add_argument("--hidden-size", type=int, default=256, help="Hidden size")
+    parser.add_argument("--num-layers", type=int, default=6, help="Number of layers")
+    parser.add_argument("--num-heads", type=int, default=4, help="Number of attention heads")
     parser.add_argument("--head-dim", type=int, default=64, help="Head dimension")
     parser.add_argument("--mlp-ratio", type=float, default=4.0, help="MLP expansion ratio")
     
@@ -942,6 +958,7 @@ def main():
         mlp_ratio=config.mlp_ratio,
         max_seq_len=config.max_seq_len,
         use_flash_attn=config.use_flash_attention,
+        gradient_checkpointing=config.gradient_checkpointing,
     )
     
     num_params = model.get_num_params()
