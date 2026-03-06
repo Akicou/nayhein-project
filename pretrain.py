@@ -582,7 +582,7 @@ class UltraFineWebDataset(Dataset):
         split: str = "en",
         seq_len: int = 512,
         tokenizer=None,
-        max_samples: Optional[int] = 100000,
+        max_samples: Optional[int] = 10000,
     ):
         """
         Load Ultra-FineWeb dataset.
