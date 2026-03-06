@@ -308,7 +308,11 @@ class DualModeModel(nn.Module):
         
         # Embeddings
         self.token_embeddings = nn.Embedding(vocab_size, hidden_size)
-        self.position_embeddings = nn.Embedding(max_seq_len, hidden_size)
+        # Position embeddings - use smaller base since RoPE handles extrapolation
+        # For long context (256K), use 8192 as base and interpolate
+        base_pos_len = min(max_seq_len, 8192)
+        self.position_embeddings = nn.Embedding(base_pos_len, hidden_size)
+        self.max_seq_len = max_seq_len  # RoPE will extrapolate beyond base_pos_len
         self.embed_layernorm = nn.LayerNorm(hidden_size, eps=1e-6)
         
         # Transformer blocks
@@ -641,20 +645,9 @@ class UltraFineWebDataset(Dataset):
 
 def get_default_tokenizer():
     """Get a default tokenizer for the dataset."""
-    try:
-        from transformers import AutoTokenizer
-        # Use a small, efficient tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(
-            "meta-llama/Llama-3.2-1B",
-            trust_remote_code=True,
-            use_fast=False,
-        )
-    except Exception as e:
-        print(f"Warning: Could not load Llama tokenizer: {e}")
-        print("Using GPT-2 tokenizer as fallback...")
-        from transformers import GPT2Tokenizer
-        model_name = "gpt2"  # public tokenizer
-        tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+    from transformers import GPT2Tokenizer
+    # Use GPT-2 tokenizer (public, no auth required)
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     
     # Ensure padding token is set
     if tokenizer.pad_token is None:
