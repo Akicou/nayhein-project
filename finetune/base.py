@@ -23,7 +23,6 @@ from transformers import (
     AutoTokenizer,
     PreTrainedModel,
     PreTrainedTokenizer,
-    BitsAndBytesConfig,
 )
 from peft import (
     LoraConfig,
@@ -170,6 +169,8 @@ class BaseFinetuner(ABC):
         if self.config.use_qlora:
             if self.config.quantization_bits != 4:
                 raise ValueError("QLoRA currently supports 4-bit quantization only")
+            if not getattr(model, "is_loaded_in_4bit", False):
+                raise ValueError("--use-qlora requires a 4-bit loaded model (HF quantized load path)")
             model = prepare_model_for_kbit_training(model)
 
         peft_config = LoraConfig(

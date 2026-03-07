@@ -16,6 +16,11 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+import sys
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 try:
     from datasets import load_dataset
     HAS_DATASETS = True
@@ -42,6 +47,7 @@ except ImportError:
     HAS_BNB = False
 
 from .base import BaseFinetuner, TrainerConfig
+from pretrain import DualModeModel, get_default_tokenizer
 
 
 class InstructionDataset(Dataset):
@@ -309,7 +315,45 @@ class ToolCallingDataset(Dataset):
         }
 
 
+class CustomDualModeAdapterModel(nn.Module):
+    """HF-like wrapper exposing save_pretrained for custom DualModeModel checkpoints."""
+
+    def __init__(self, model: DualModeModel):
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        outputs = self.model(input_ids, labels=labels, mode="ar", is_training=labels is not None)
+        logits = outputs["ar_logits"]
+        loss = outputs.get("ar_loss") if labels is not None else None
+        return type("CausalLMOutput", (), {"logits": logits, "loss": loss})
+
+    def save_pretrained(self, save_directory):
+        save_dir = Path(save_directory)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(self.model.state_dict(), save_dir / "model.pt")
+        torch.save({
+            "vocab_size": self.model.vocab_size,
+            "original_vocab_size": self.model.original_vocab_size,
+            "mask_token_id": self.model.mask_token_id,
+            "hidden_size": self.model.hidden_size,
+            "num_layers": self.model.num_layers,
+            "num_heads": self.model.num_heads,
+            "head_dim": self.model.head_dim,
+            "max_seq_len": self.model.max_seq_len,
+            "mlp_ratio": getattr(self.model, "mlp_ratio", 4.0),
+            "mtp_enabled": getattr(self.model, "mtp_enabled", False),
+            "mtp_num_heads": getattr(self.model, "mtp_num_heads", 0),
+            "mtp_loss_weights": getattr(self.model, "mtp_loss_weights", [1.0, 0.7, 0.5]),
+        }, save_dir / "config.pt")
+
+
 class SFTTrainer(BaseFinetuner):
+    @staticmethod
+    def _is_custom_checkpoint_dir(path: str) -> bool:
+        p = Path(path)
+        return p.is_dir() and (p / "model.pt").exists() and (p / "config.pt").exists()
+
     """
     Supervised Fine-Tuning trainer.
     
@@ -329,6 +373,31 @@ class SFTTrainer(BaseFinetuner):
         """Setup model for SFT."""
         print(f"Loading model from {self.config.model_path}")
 
+        if self._is_custom_checkpoint_dir(self.config.model_path):
+            if self.config.use_qlora:
+                raise ValueError("QLoRA is only supported for Hugging Face model directories in this trainer")
+            if self.config.use_lora:
+                raise ValueError("LoRA adapters are only supported for Hugging Face model directories in this trainer")
+            custom_cfg = torch.load(Path(self.config.model_path) / "config.pt", map_location="cpu")
+            base_vocab = custom_cfg.get("original_vocab_size", custom_cfg.get("vocab_size", 16001) - 1)
+            base_model = DualModeModel(
+                vocab_size=base_vocab,
+                hidden_size=custom_cfg.get("hidden_size", 256),
+                num_layers=custom_cfg.get("num_layers", 6),
+                num_heads=custom_cfg.get("num_heads", 4),
+                head_dim=custom_cfg.get("head_dim", 64),
+                mlp_ratio=custom_cfg.get("mlp_ratio", 4.0),
+                max_seq_len=custom_cfg.get("max_seq_len", 4096),
+                mtp_enabled=custom_cfg.get("mtp_enabled", False),
+                mtp_num_heads=custom_cfg.get("mtp_num_heads", 3),
+                mtp_loss_weights=custom_cfg.get("mtp_loss_weights", [1.0, 0.7, 0.5]),
+            )
+            state_dict = torch.load(Path(self.config.model_path) / "model.pt", map_location="cpu")
+            base_model.load_state_dict(state_dict)
+            model = CustomDualModeAdapterModel(base_model)
+            model._is_custom_dualmode = True
+            return model
+
         if self.config.use_qlora:
             compute_dtype = torch.bfloat16 if self.config.quantization_compute_dtype == "bfloat16" else torch.float16
             qconfig = BitsAndBytesConfig(
@@ -345,20 +414,25 @@ class SFTTrainer(BaseFinetuner):
                 trust_remote_code=True,
             )
         else:
-            # Load model
             model = AutoModelForCausalLM.from_pretrained(
                 self.config.model_path,
                 torch_dtype=torch.bfloat16 if self.config.mixed_precision == "bf16" else torch.float32,
                 device_map=self.config.device,
                 trust_remote_code=True,
             )
-        
-        # Gradient checkpointing
+
         if self.config.use_gradient_checkpointing:
             model.gradient_checkpointing_enable()
-        
+
         return model
     
+    def setup_tokenizer(self) -> PreTrainedTokenizer:
+        if self._is_custom_checkpoint_dir(self.config.model_path):
+            tokenizer = get_default_tokenizer()
+            self.tokenizer = tokenizer
+            return tokenizer
+        return super().setup_tokenizer()
+
     def setup_data(self) -> tuple:
         """Setup training and evaluation data."""
         if self.config.hf_dataset_name:
@@ -436,14 +510,13 @@ class SFTTrainer(BaseFinetuner):
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
         labels = batch["labels"]
-        
-        # Forward pass
+
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
         )
-        
+
         loss = outputs.loss
         
         # Backward
