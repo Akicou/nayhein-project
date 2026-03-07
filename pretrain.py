@@ -354,12 +354,12 @@ class DualModeModel(nn.Module):
         # Final layer norm
         self.final_layernorm = nn.LayerNorm(hidden_size, eps=1e-6)
         
-        # Heads sharing the backbone
-        self.ar_head = ARHead(hidden_size, vocab_size)
-        self.diffusion_head = DiffusionHead(hidden_size, vocab_size)
+        # Heads sharing the backbone (must include diffusion mask token)
+        self.ar_head = ARHead(hidden_size, self.vocab_size)
+        self.diffusion_head = DiffusionHead(hidden_size, self.vocab_size)
         # Medusa-like MTP heads for AR multi-token prediction
         self.mtp_heads = nn.ModuleList([
-            ARHead(hidden_size, vocab_size) for _ in range(self.mtp_num_heads)
+            ARHead(hidden_size, self.vocab_size) for _ in range(self.mtp_num_heads)
         ]) if self.mtp_enabled else nn.ModuleList()
         
         # Initialize weights
