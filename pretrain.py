@@ -742,8 +742,8 @@ class UltraFineWebDataset(Dataset):
     
     def __getitem__(self, idx: int) -> torch.Tensor:
         if self._dummy_mode or idx >= len(self._data):
-            # Return random tokens for dummy mode or out of bounds
-            return torch.randint(0, 32000, (self.seq_len,), dtype=torch.long)
+            # Deterministic fallback to EOS tokens (avoid random garbage targets)
+            return torch.full((self.seq_len,), self.tokenizer.eos_token_id, dtype=torch.long)
         
         try:
             item = self._data[idx]
@@ -751,8 +751,8 @@ class UltraFineWebDataset(Dataset):
             text = item.get("content", item.get("text", ""))
             
             if not text:
-                # Return random tokens for empty text
-                return torch.randint(0, 32000, (self.seq_len,), dtype=torch.long)
+                # Deterministic fallback to EOS tokens for empty text
+                return torch.full((self.seq_len,), self.tokenizer.eos_token_id, dtype=torch.long)
             
             # Tokenize
             tokens = self.tokenizer.encode(
@@ -766,8 +766,8 @@ class UltraFineWebDataset(Dataset):
             return tokens.squeeze(0)
             
         except Exception as e:
-            # Skip problematic items
-            return torch.randint(0, 32000, (self.seq_len,), dtype=torch.long)
+            # Deterministic fallback for problematic items
+            return torch.full((self.seq_len,), self.tokenizer.eos_token_id, dtype=torch.long)
 
 
 def get_default_tokenizer():
@@ -828,6 +828,9 @@ class TrainingConfig:
     loss_mode: str = "both"  # "ar", "diffusion", or "both"
     ar_loss_weight: float = 1.0
     diffusion_loss_weight: float = 1.0
+    diffusion_mask_prob: float = 0.15
+    diffusion_mask_prob_start: Optional[float] = None
+    diffusion_mask_prob_end: Optional[float] = None
     mtp_enabled: bool = True
     mtp_num_heads: int = 3
     mtp_loss_weights: List[float] = field(default_factory=lambda: [1.0, 0.7, 0.5])
@@ -881,6 +884,11 @@ def train_epoch(
             batch = batch.to(config.device)
         
         # Forward pass
+        # Optional mask-probability curriculum for diffusion training
+        if config.loss_mode in ("diffusion", "both") and config.diffusion_mask_prob_start is not None and config.diffusion_mask_prob_end is not None and config.max_train_steps:
+            progress = min(1.0, global_step / max(1, config.max_train_steps - 1))
+            model.diffusion_mask_prob = config.diffusion_mask_prob_start + (config.diffusion_mask_prob_end - config.diffusion_mask_prob_start) * progress
+
         outputs = model(batch, labels=batch, mode=config.loss_mode, is_training=True)
         
         # Compute loss
@@ -1096,6 +1104,9 @@ def main():
     parser.add_argument("--loss-mode", type=str, default="both", choices=["ar", "diffusion", "both"], help="Loss mode")
     parser.add_argument("--ar-loss-weight", type=float, default=1.0, help="AR loss weight")
     parser.add_argument("--diffusion-loss-weight", type=float, default=1.0, help="Diffusion loss weight")
+    parser.add_argument("--diffusion-mask-prob", type=float, default=0.15, help="Static diffusion masking probability")
+    parser.add_argument("--diffusion-mask-prob-start", type=float, default=None, help="Optional curriculum start mask probability")
+    parser.add_argument("--diffusion-mask-prob-end", type=float, default=None, help="Optional curriculum end mask probability")
     parser.add_argument("--mtp-enabled", action="store_true", default=True, help="Enable Medusa-style MTP heads for AR training (default: enabled)")
     parser.add_argument("--no-mtp", action="store_true", help="Disable Medusa-style MTP heads")
     parser.add_argument("--mtp-num-heads", type=int, default=3, help="Number of MTP heads")
@@ -1140,6 +1151,9 @@ def main():
         loss_mode=args.loss_mode,
         ar_loss_weight=args.ar_loss_weight,
         diffusion_loss_weight=args.diffusion_loss_weight,
+        diffusion_mask_prob=args.diffusion_mask_prob,
+        diffusion_mask_prob_start=args.diffusion_mask_prob_start,
+        diffusion_mask_prob_end=args.diffusion_mask_prob_end,
         mtp_enabled=mtp_enabled,
         mtp_num_heads=args.mtp_num_heads,
         mtp_loss_weights=mtp_loss_weights,
@@ -1190,6 +1204,7 @@ def main():
         max_seq_len=config.max_seq_len,
         use_flash_attn=config.use_flash_attention,
         gradient_checkpointing=config.use_gradient_checkpointing,
+        diffusion_mask_prob=config.diffusion_mask_prob,
         mtp_enabled=config.mtp_enabled,
         mtp_num_heads=config.mtp_num_heads,
         mtp_loss_weights=config.mtp_loss_weights,
