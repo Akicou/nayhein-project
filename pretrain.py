@@ -484,11 +484,12 @@ class DualModeModel(nn.Module):
                 # Shift for causal language modeling
                 shift_logits = ar_logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
-                # Clamp labels to vocab_size range
-                shift_labels = shift_labels.clamp(0, self.vocab_size - 1)
+                ar_vocab_size = ar_logits.size(-1)
+                # AR labels should never include the diffusion mask token
+                shift_labels = shift_labels.clamp(0, ar_vocab_size - 1)
                 
                 loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-                ar_loss = loss_fct(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1))
+                ar_loss = loss_fct(shift_logits.view(-1, ar_vocab_size), shift_labels.view(-1))
                 outputs["ar_loss"] = ar_loss
 
                 # MTP loss: head i predicts token at t+(i+1)
@@ -498,8 +499,9 @@ class DualModeModel(nn.Module):
                         horizon = i + 1
                         if seq_len > horizon:
                             h_shift_logits = h_logits[..., :-horizon, :].contiguous()
-                            h_shift_labels = labels[..., horizon:].contiguous().clamp(0, self.vocab_size - 1)
-                            h_loss = loss_fct(h_shift_logits.view(-1, self.vocab_size), h_shift_labels.view(-1))
+                            mtp_vocab_size = h_logits.size(-1)
+                            h_shift_labels = labels[..., horizon:].contiguous().clamp(0, mtp_vocab_size - 1)
+                            h_loss = loss_fct(h_shift_logits.view(-1, mtp_vocab_size), h_shift_labels.view(-1))
                         else:
                             h_loss = torch.tensor(0.0, device=hidden_states.device)
                         mtp_losses.append(h_loss)
@@ -527,13 +529,15 @@ class DualModeModel(nn.Module):
                     loss_labels = clamped_labels.clone()
                     loss_labels[~masked_positions] = -100
                     
+                    diffusion_vocab_size = diffusion_logits.size(-1)
                     loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-                    diffusion_loss = loss_fct(diffusion_logits.view(-1, self.vocab_size), loss_labels.view(-1))
+                    diffusion_loss = loss_fct(diffusion_logits.view(-1, diffusion_vocab_size), loss_labels.view(-1))
                 else:
                     # No masking applied (inference or eval mode) - compute loss on all tokens
-                    clamped_labels = clamped_labels.clamp(0, self.original_vocab_size - 1)
+                    diffusion_vocab_size = diffusion_logits.size(-1)
+                    clamped_labels = clamped_labels.clamp(0, diffusion_vocab_size - 1)
                     loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-                    diffusion_loss = loss_fct(diffusion_logits.view(-1, self.vocab_size), clamped_labels.view(-1))
+                    diffusion_loss = loss_fct(diffusion_logits.view(-1, diffusion_vocab_size), clamped_labels.view(-1))
                 
                 outputs["diffusion_loss"] = diffusion_loss
         
