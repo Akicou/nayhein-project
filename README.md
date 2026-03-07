@@ -394,5 +394,6 @@ python -c "from pretrain import DualModeModel; print('Import OK')"
 ## License
 
 MIT License
-#   - s c a l e - u p - a u t o r e g r e s s i v e - d i f f u s i o n - m o d e l l i n g  
+#   - s c a l e - u p - a u t o r e g r e s s i v e - d i f f u s i o n - m o d e l l i n g 
+ 
  
