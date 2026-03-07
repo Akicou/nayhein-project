@@ -844,11 +844,23 @@ def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, schedule
     """Save model checkpoint."""
     os.makedirs(config.output_dir, exist_ok=True)
     
-    # Save model in HuggingFace format
+    # Save model checkpoint
     save_path = Path(config.output_dir) / f"checkpoint-epoch{epoch}-step{step}"
     save_path.mkdir(exist_ok=True)
     
-    model.save_pretrained(save_path)
+    # Save model state dict (plain PyTorch)
+    torch.save(model.state_dict(), save_path / "model.pt")
+    
+    # Save model config
+    config_dict = {
+        "vocab_size": model.vocab_size,
+        "hidden_size": model.hidden_size,
+        "num_layers": model.num_layers,
+        "num_heads": model.num_heads,
+        "head_dim": model.head_dim,
+        "max_seq_len": model.max_seq_len,
+    }
+    torch.save(config_dict, save_path / "config.pt")
     
     # Save optimizer state
     torch.save({
