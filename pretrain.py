@@ -528,10 +528,11 @@ class DualModeModel(nn.Module):
                 if masked_positions is not None:
                     # Only compute loss on masked positions
                     # Set non-masked positions to ignore_index (-100)
+                    diffusion_vocab_size = diffusion_logits.size(-1)
+                    clamped_labels = clamped_labels.clamp(0, diffusion_vocab_size - 1)
                     loss_labels = clamped_labels.clone()
                     loss_labels[~masked_positions] = -100
                     
-                    diffusion_vocab_size = diffusion_logits.size(-1)
                     loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
                     diffusion_loss = loss_fct(diffusion_logits.view(-1, diffusion_vocab_size), loss_labels.view(-1))
                 else:
@@ -1229,20 +1230,57 @@ def main():
     # If tokenizer-based training is used, align model vocab to tokenizer length BEFORE training
     if tokenizer is not None:
         tokenizer_size = len(tokenizer)
-        if tokenizer_size != model.vocab_size:
-            print(f"Aligning model vocab to tokenizer: model={model.vocab_size}, tokenizer={tokenizer_size}")
+        # Model reserves one extra token for diffusion mask => expected vocab is tokenizer_size + 1
+        target_model_vocab = tokenizer_size + 1
+        if target_model_vocab != model.vocab_size:
+            print(f"Aligning model vocab to tokenizer: model={model.vocab_size}, tokenizer+mask={target_model_vocab}")
+
+            # Resize token embeddings
             old_embeddings = model.token_embeddings
-            new_embeddings = nn.Embedding(tokenizer_size, model.hidden_size).to(device)
-            copy_n = min(old_embeddings.num_embeddings, tokenizer_size)
+            new_embeddings = nn.Embedding(target_model_vocab, model.hidden_size).to(device)
+            copy_n = min(old_embeddings.num_embeddings, target_model_vocab)
             with torch.no_grad():
                 new_embeddings.weight[:copy_n] = old_embeddings.weight[:copy_n]
-                if tokenizer_size > copy_n:
+                if target_model_vocab > copy_n:
                     torch.nn.init.normal_(new_embeddings.weight[copy_n:], mean=0.0, std=0.02)
             model.token_embeddings = new_embeddings
-            model.vocab_size = tokenizer_size
+
+            # Resize AR head
+            old_ar_head = model.ar_head.lm_head
+            new_ar_head = nn.Linear(model.hidden_size, target_model_vocab, bias=False).to(device)
+            ar_copy_n = min(old_ar_head.out_features, target_model_vocab)
+            with torch.no_grad():
+                new_ar_head.weight[:ar_copy_n] = old_ar_head.weight[:ar_copy_n]
+                if target_model_vocab > ar_copy_n:
+                    torch.nn.init.normal_(new_ar_head.weight[ar_copy_n:], mean=0.0, std=0.02)
+            model.ar_head.lm_head = new_ar_head
+
+            # Resize diffusion decoder
+            old_diff_decoder = model.diffusion_head.decoder
+            new_diff_decoder = nn.Linear(model.hidden_size, target_model_vocab, bias=False).to(device)
+            diff_copy_n = min(old_diff_decoder.out_features, target_model_vocab)
+            with torch.no_grad():
+                new_diff_decoder.weight[:diff_copy_n] = old_diff_decoder.weight[:diff_copy_n]
+                if target_model_vocab > diff_copy_n:
+                    torch.nn.init.normal_(new_diff_decoder.weight[diff_copy_n:], mean=0.0, std=0.02)
+            model.diffusion_head.decoder = new_diff_decoder
+
+            # Resize MTP heads if enabled
+            if getattr(model, "mtp_enabled", False) and len(getattr(model, "mtp_heads", [])) > 0:
+                for i, mtp_head in enumerate(model.mtp_heads):
+                    old_mtp = mtp_head.lm_head
+                    new_mtp = nn.Linear(model.hidden_size, target_model_vocab, bias=False).to(device)
+                    mtp_copy_n = min(old_mtp.out_features, target_model_vocab)
+                    with torch.no_grad():
+                        new_mtp.weight[:mtp_copy_n] = old_mtp.weight[:mtp_copy_n]
+                        if target_model_vocab > mtp_copy_n:
+                            torch.nn.init.normal_(new_mtp.weight[mtp_copy_n:], mean=0.0, std=0.02)
+                    model.mtp_heads[i].lm_head = new_mtp
+
+            model.vocab_size = target_model_vocab
             # Keep mask token as last token id in aligned vocab
-            model.mask_token_id = tokenizer_size - 1
-            model.original_vocab_size = max(1, tokenizer_size - 1)
+            model.mask_token_id = target_model_vocab - 1
+            model.original_vocab_size = tokenizer_size
             num_params = model.get_num_params()
             print(f"Updated parameters after vocab alignment: {num_params:,} ({num_params / 1e6:.1f}M)")
     
