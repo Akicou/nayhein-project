@@ -214,7 +214,6 @@ class BaseFinetuner(ABC):
         self.accelerator = accelerate.Accelerator(
             gradient_accumulation_steps=self.config.gradient_accumulation_steps,
             mixed_precision=self.config.mixed_precision,
-            log_interval=self.config.log_interval,
         )
         
         # Prepare with accelerator
