@@ -36,76 +36,170 @@ from pretrain import DualModeModel, ARHead, DiffusionHead
 # Scaling Methods
 # ============================================================================
 
+def _estimate_params(config: Dict[str, Any]) -> int:
+    """Estimate DualModeModel parameter count using architecture-aware formula."""
+    hidden_size = int(config["hidden_size"])
+    num_layers = int(config["num_layers"])
+    num_heads = int(config["num_heads"])
+    head_dim = int(config["head_dim"])
+    mlp_ratio = float(config.get("mlp_ratio", 4.0))
+    max_seq_len = int(config.get("max_seq_len", 2048))
+    base_vocab_size = int(config["base_vocab_size"])
+
+    # DualModeModel reserves one extra mask token internally.
+    effective_vocab_size = base_vocab_size + 1
+    base_pos_len = min(max_seq_len, 8192)
+
+    attn_dim = num_heads * head_dim
+    mlp_dim = int(hidden_size * mlp_ratio)
+
+    # Embeddings + embed LN
+    token_embed = effective_vocab_size * hidden_size
+    pos_embed = base_pos_len * hidden_size
+    embed_ln = 2 * hidden_size
+
+    # Per transformer block
+    # q/k/v/o (bias=False) + MLP gate/up/down (bias=False) + 2 layer norms
+    per_layer = (4 * hidden_size * attn_dim) + (3 * hidden_size * mlp_dim) + (4 * hidden_size)
+
+    # Final LN
+    final_ln = 2 * hidden_size
+
+    # Heads: AR lm_head (bias=False) + diffusion dense (bias=True) + diffusion LN + diffusion decoder (bias=False)
+    ar_head = hidden_size * effective_vocab_size
+    diffusion_head = (hidden_size * hidden_size + hidden_size) + (2 * hidden_size) + (hidden_size * effective_vocab_size)
+
+    total = token_embed + pos_embed + embed_ln + (num_layers * per_layer) + final_ln + ar_head + diffusion_head
+    return int(total)
+
+
+def _normalize_heads(hidden_size: int, preferred_heads: int) -> Tuple[int, int]:
+    """Return (num_heads, head_dim) with hidden_size divisible by num_heads."""
+    num_heads = max(1, min(preferred_heads, hidden_size))
+    while hidden_size % num_heads != 0 and num_heads > 1:
+        num_heads -= 1
+    head_dim = hidden_size // num_heads
+    return num_heads, head_dim
+
+
 def calculate_target_config(
     current_config: Dict[str, Any],
     target_params: int,
     method: str = "width+depth",
 ) -> Dict[str, Any]:
-    """
-    Calculate target configuration based on desired parameter count.
-    
-    Args:
-        current_config: Current model configuration
-        target_params: Target parameter count
-        method: Scaling method ("width", "depth", "width+depth")
-    
-    Returns:
-        Target configuration dictionary
-    """
-    # Estimate current parameters
-    vocab_size = current_config.get("vocab_size", 32000)
-    hidden_size = current_config.get("hidden_size", 512)
-    num_layers = current_config.get("num_layers", 10)
-    num_heads = current_config.get("num_heads", 8)
-    head_dim = current_config.get("head_dim", 64)
-    
-    # Rough parameter estimation
-    # Embedding: vocab_size * hidden_size
-    # Per layer: ~2 * hidden_size^2 + 4 * hidden_size * (hidden_size * 4)
-    params_per_layer = 2 * hidden_size ** 2 + 4 * hidden_size * (hidden_size * 4)
-    current_params = vocab_size * hidden_size + num_layers * params_per_layer + hidden_size * vocab_size
-    
-    # Calculate scaling factor
-    scale_factor = (target_params / current_params) ** 0.5
-    
+    """Calculate target configuration using architecture-aware parameter estimation."""
+    base_vocab_size = int(current_config.get("base_vocab_size", current_config.get("vocab_size", 32000) - 1))
+    hidden_size = int(current_config.get("hidden_size", 512))
+    num_layers = int(current_config.get("num_layers", 10))
+    num_heads = int(current_config.get("num_heads", 8))
+    head_dim = int(current_config.get("head_dim", max(1, hidden_size // max(1, num_heads))))
+    mlp_ratio = float(current_config.get("mlp_ratio", 4.0))
+    max_seq_len = int(current_config.get("max_seq_len", 2048))
+
+    def make_cfg(h: int, l: int, nh: Optional[int] = None) -> Dict[str, Any]:
+        nh_val = nh if nh is not None else num_heads
+        nh_val, hd_val = _normalize_heads(h, nh_val)
+        return {
+            "base_vocab_size": base_vocab_size,
+            "vocab_size": base_vocab_size + 1,
+            "hidden_size": int(h),
+            "num_layers": int(max(1, l)),
+            "num_heads": int(nh_val),
+            "head_dim": int(hd_val),
+            "mlp_ratio": mlp_ratio,
+            "max_seq_len": max_seq_len,
+        }
+
+    current_exact = _estimate_params(make_cfg(hidden_size, num_layers, num_heads))
+    target_params = int(target_params)
+
+    if method == "depth":
+        low, high = 1, max(2, int(num_layers * max(2.0, target_params / max(1, current_exact))))
+        best_cfg = make_cfg(hidden_size, num_layers, num_heads)
+        best_delta = abs(_estimate_params(best_cfg) - target_params)
+        while low <= high:
+            mid = (low + high) // 2
+            cfg = make_cfg(hidden_size, mid, num_heads)
+            p = _estimate_params(cfg)
+            delta = abs(p - target_params)
+            if delta < best_delta:
+                best_cfg, best_delta = cfg, delta
+            if p < target_params:
+                low = mid + 1
+            else:
+                high = mid - 1
+        return best_cfg
+
     if method == "width":
-        # Only scale width
-        new_hidden_size = int(hidden_size * scale_factor)
-        new_num_heads = max(1, int(num_heads * scale_factor))
-        new_head_dim = new_hidden_size // new_num_heads
-        new_num_layers = num_layers
-        
-    elif method == "depth":
-        # Only scale depth
-        new_hidden_size = hidden_size
-        new_num_heads = num_heads
-        new_head_dim = head_dim
-        new_num_layers = int(num_layers * scale_factor)
-        
-    else:  # width+depth
-        # Balance width and depth
-        width_scale = scale_factor ** 0.7
-        depth_scale = scale_factor ** 0.5
-        
-        new_hidden_size = int(hidden_size * width_scale)
-        new_num_heads = max(1, int(num_heads * width_scale))
-        new_head_dim = new_hidden_size // new_num_heads
-        new_num_layers = int(num_layers * depth_scale)
-    
-    # Ensure head_dim divides hidden_size evenly
-    while new_hidden_size % new_num_heads != 0:
-        new_num_heads -= 1
-    new_head_dim = new_hidden_size // new_num_heads
-    
-    return {
-        "vocab_size": vocab_size,
-        "hidden_size": new_hidden_size,
-        "num_layers": new_num_layers,
-        "num_heads": new_num_heads,
-        "head_dim": new_head_dim,
-        "mlp_ratio": current_config.get("mlp_ratio", 4.0),
-        "max_seq_len": current_config.get("max_seq_len", 2048),
-    }
+        low_h = max(num_heads, hidden_size // 2)
+        high_h = max(hidden_size + num_heads, int(hidden_size * max(2.0, (target_params / max(1, current_exact)) ** 0.6)) + num_heads)
+        best_cfg = make_cfg(hidden_size, num_layers, num_heads)
+        best_delta = abs(_estimate_params(best_cfg) - target_params)
+
+        lo = (low_h // num_heads) * num_heads
+        hi = ((high_h + num_heads - 1) // num_heads) * num_heads
+        if lo < num_heads:
+            lo = num_heads
+
+        while lo <= hi:
+            mid = ((lo + hi) // (2 * num_heads)) * num_heads
+            mid = max(num_heads, mid)
+            cfg = make_cfg(mid, num_layers, num_heads)
+            p = _estimate_params(cfg)
+            delta = abs(p - target_params)
+            if delta < best_delta:
+                best_cfg, best_delta = cfg, delta
+            if p < target_params:
+                lo = mid + num_heads
+            else:
+                hi = mid - num_heads
+        return best_cfg
+
+    # width+depth: balanced start then local greedy refinement
+    scale = max(1e-9, target_params / max(1, current_exact))
+    start_hidden = max(num_heads, int(hidden_size * (scale ** 0.30)))
+    start_hidden = ((start_hidden + num_heads - 1) // num_heads) * num_heads
+    start_layers = max(1, int(round(num_layers * (scale ** 0.40))))
+
+    best_cfg = make_cfg(start_hidden, start_layers, num_heads)
+    best_params = _estimate_params(best_cfg)
+
+    step_h = max(num_heads, (hidden_size // num_heads) * num_heads)
+    step_l = max(1, num_layers // 4)
+
+    for _ in range(120):
+        improved = False
+        candidates = []
+        h = best_cfg["hidden_size"]
+        l = best_cfg["num_layers"]
+
+        for nh, nl in [
+            (h + step_h, l),
+            (max(num_heads, h - step_h), l),
+            (h, l + step_l),
+            (h, max(1, l - step_l)),
+            (h + step_h, l + step_l),
+            (max(num_heads, h - step_h), max(1, l - step_l)),
+        ]:
+            cfg = make_cfg(nh, nl, num_heads)
+            p = _estimate_params(cfg)
+            candidates.append((abs(p - target_params), cfg, p))
+
+        candidates.sort(key=lambda x: x[0])
+        cand_delta, cand_cfg, cand_params = candidates[0]
+        if cand_delta < abs(best_params - target_params):
+            best_cfg, best_params = cand_cfg, cand_params
+            improved = True
+
+        if not improved:
+            if step_h > num_heads:
+                step_h = max(num_heads, step_h // 2)
+            if step_l > 1:
+                step_l = max(1, step_l // 2)
+            if step_h == num_heads and step_l == 1:
+                break
+
+    return best_cfg
 
 
 def expand_embedding_dim(
@@ -485,13 +579,20 @@ def scale_model(
     print(f"Loaded model from {input_path}")
     
     # Get current config
+    # DualModeModel internally adds one mask token; expose base vocab size for scaling math.
+    base_vocab_size = getattr(model, "original_vocab_size", model.vocab_size - 1)
+    inferred_mlp_ratio = 4.0
+    if len(model.layers) > 0 and hasattr(model.layers[0], "mlp"):
+        inferred_mlp_ratio = model.layers[0].mlp.gate_proj.out_features / model.hidden_size
+
     current_config = {
+        "base_vocab_size": int(base_vocab_size),
         "vocab_size": model.vocab_size,
         "hidden_size": model.hidden_size,
         "num_layers": model.num_layers,
         "num_heads": model.num_heads,
         "head_dim": model.head_dim,
-        "mlp_ratio": 4.0,
+        "mlp_ratio": inferred_mlp_ratio,
         "max_seq_len": model.max_seq_len,
     }
     
@@ -501,6 +602,8 @@ def scale_model(
     # Calculate target config
     target_config = calculate_target_config(current_config, target_params, method)
     print(f"\nTarget config: {target_config}")
+    estimated_target_params = _estimate_params(target_config)
+    print(f"Estimated target parameters from config: {estimated_target_params:,}")
     
     # Scale model
     print(f"\n=== Scaling Model ({method}) ===")
@@ -534,6 +637,8 @@ def scale_model(
         "method": method,
         "interpolate_pos_embeddings": interpolate_pos,
         "target_parameters": target_params,
+        "estimated_target_parameters": estimated_target_params,
+        "actual_scaled_parameters": scaled_model.get_num_params(),
         "current_config": current_config,
         "target_config": target_config,
     }
