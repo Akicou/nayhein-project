@@ -217,9 +217,14 @@ class BaseFinetuner(ABC):
         )
         
         # Prepare with accelerator
-        self.model, self.optimizer, self.train_loader = self.accelerator.prepare(
-            self.model, self.optimizer, self.train_loader
-        )
+        if self.eval_loader is not None:
+            self.model, self.optimizer, self.train_loader, self.eval_loader = self.accelerator.prepare(
+                self.model, self.optimizer, self.train_loader, self.eval_loader
+            )
+        else:
+            self.model, self.optimizer, self.train_loader = self.accelerator.prepare(
+                self.model, self.optimizer, self.train_loader
+            )
         
         # Initialize wandb
         if self.config.wandb_project and HAS_WANDB:
