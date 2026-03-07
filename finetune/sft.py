@@ -25,6 +25,7 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizer,
     DataCollatorForLanguageModeling,
+    BitsAndBytesConfig,
 )
 from peft import LoraConfig, get_peft_model, TaskType
 
@@ -250,14 +251,30 @@ class SFTTrainer(BaseFinetuner):
     def setup_model(self) -> PreTrainedModel:
         """Setup model for SFT."""
         print(f"Loading model from {self.config.model_path}")
-        
-        # Load model
-        model = AutoModelForCausalLM.from_pretrained(
-            self.config.model_path,
-            torch_dtype=torch.bfloat16 if self.config.mixed_precision == "bf16" else torch.float32,
-            device_map=self.config.device,
-            trust_remote_code=True,
-        )
+
+        if self.config.use_qlora:
+            compute_dtype = torch.bfloat16 if self.config.quantization_compute_dtype == "bfloat16" else torch.float16
+            qconfig = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                self.config.model_path,
+                quantization_config=qconfig,
+                torch_dtype=compute_dtype,
+                device_map=self.config.device,
+                trust_remote_code=True,
+            )
+        else:
+            # Load model
+            model = AutoModelForCausalLM.from_pretrained(
+                self.config.model_path,
+                torch_dtype=torch.bfloat16 if self.config.mixed_precision == "bf16" else torch.float32,
+                device_map=self.config.device,
+                trust_remote_code=True,
+            )
         
         # Gradient checkpointing
         if self.config.use_gradient_checkpointing:
@@ -381,6 +398,9 @@ def main():
         lora_dropout=args.lora_dropout,
         lora_target_modules=args.lora_target_modules,
         use_qlora=args.use_qlora,
+        quantization_bits=args.quantization_bits,
+        quantization_compute_dtype=args.quantization_compute_dtype,
+        save_mode=args.save_mode,
         use_gradient_checkpointing=args.use_gradient_checkpointing,
         mixed_precision=args.mixed_precision,
         log_interval=args.log_interval,

@@ -6,6 +6,7 @@ Base finetuner class with common training functionality.
 import argparse
 import json
 import os
+import shutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,12 +23,14 @@ from transformers import (
     AutoTokenizer,
     PreTrainedModel,
     PreTrainedTokenizer,
+    BitsAndBytesConfig,
 )
 from peft import (
     LoraConfig,
     get_peft_model,
     PeftModel,
     TaskType,
+    prepare_model_for_kbit_training,
 )
 import accelerate
 
@@ -69,6 +72,9 @@ class TrainerConfig:
     use_qlora: bool = False
     quantization_bits: int = 4
     quantization_compute_dtype: str = "bfloat16"
+
+    # Save mode
+    save_mode: str = "adapter"  # "adapter" or "merged"
     
     # Optimization
     use_gradient_checkpointing: bool = True
@@ -153,7 +159,12 @@ class BaseFinetuner(ABC):
         return tokenizer
     
     def setup_lora(self, model: PreTrainedModel) -> PeftModel:
-        """Setup LoRA configuration."""
+        """Setup LoRA/QLoRA configuration."""
+        if self.config.use_qlora:
+            if self.config.quantization_bits != 4:
+                raise ValueError("QLoRA currently supports 4-bit quantization only")
+            model = prepare_model_for_kbit_training(model)
+
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=self.config.lora_r,
@@ -163,10 +174,10 @@ class BaseFinetuner(ABC):
             bias="none",
             inference_mode=False,
         )
-        
+
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
-        
+
         return model
     
     def setup_training(self):
@@ -212,13 +223,34 @@ class BaseFinetuner(ABC):
         """Save model checkpoint."""
         output_dir = Path(self.config.output_dir) / f"checkpoint-{step}"
         output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save adapter config for LoRA
-        if self.config.use_lora:
-            self.model.save_pretrained(output_dir)
+
+        model_to_save = self.accelerator.unwrap_model(self.model) if self.accelerator is not None else self.model
+
+        if self.config.use_lora and self.config.save_mode == "merged":
+            if not isinstance(model_to_save, PeftModel):
+                raise ValueError("save_mode=merged requires a LoRA/QLoRA PEFT model")
+
+            # Keep intermediate checkpoints as adapters so training can continue safely.
+            if step != "final":
+                if self.accelerator is None or self.accelerator.is_main_process:
+                    model_to_save.save_pretrained(output_dir)
+            else:
+                if self.accelerator is not None:
+                    self.accelerator.wait_for_everyone()
+                if self.accelerator is None or self.accelerator.is_main_process:
+                    merged = model_to_save.merge_and_unload()
+                    merged.save_pretrained(output_dir)
+                    # Preserve tokenizer/config side files from base model path when available
+                    src_model_dir = Path(self.config.model_path)
+                    for name in ["config.json", "generation_config.json", "tokenizer_config.json", "special_tokens_map.json", "tokenizer.json", "vocab.json", "merges.txt"]:
+                        src = src_model_dir / name
+                        dst = output_dir / name
+                        if src.exists() and not dst.exists():
+                            shutil.copy2(src, dst)
         else:
-            self.model.save_pretrained(output_dir)
-        
+            if self.accelerator is None or self.accelerator.is_main_process:
+                model_to_save.save_pretrained(output_dir)
+
         # Save tokenizer
         if self.tokenizer:
             self.tokenizer.save_pretrained(output_dir)
@@ -345,6 +377,11 @@ class BaseFinetuner(ABC):
         
         # QLoRA
         parser.add_argument("--use-qlora", action="store_true")
+        parser.add_argument("--quantization-bits", type=int, default=4, choices=[4], help="QLoRA quantization bits")
+        parser.add_argument("--quantization-compute-dtype", type=str, default="bfloat16", choices=["float16", "bfloat16"], help="QLoRA compute dtype")
+
+        # Save mode
+        parser.add_argument("--save-mode", type=str, default="adapter", choices=["adapter", "merged"], help="Save adapter only or merge adapter into base model")
         
         # Optimization
         parser.add_argument("--use-gradient-checkpointing", action="store_true")
