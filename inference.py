@@ -3,6 +3,7 @@
 
 import argparse
 import time
+import math
 import torch
 from typing import Dict, Any, List, Optional
 import json
@@ -70,52 +71,19 @@ def load_model(checkpoint_path: str, config_path: str, device_str: str = None):
     return model, tokenizer
 
 
-def complete(prompt: str, max_tokens: int = 100, temperature: float = 1.0, top_p: float = 1.0, mode: str = "ar", verbose: bool = True) -> Dict[str, Any]:
-    global model, tokenizer, device
-    if model is None or tokenizer is None:
-        raise RuntimeError("Model not loaded. Call load_model() first.")
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-    input_length = input_ids.shape[1]
+def complete_ar(input_ids: torch.Tensor, max_tokens: int, temperature: float, top_p: float, verbose: bool) -> tuple:
+    """Generate tokens using auto-regressive mode (one token at a time)."""
+    generated_ids = []
     start_time = time.time()
     first_token_time = None
-    generated_ids = []
+    input_length = input_ids.shape[1]
     max_length = min(input_length + max_tokens, model.max_seq_len)
-    if verbose:
-        print(f"[{mode}] Prompt: {prompt[:50]}...")
-        print(f"[{mode}] Input tokens: {input_length}")
+    
     with torch.no_grad():
         for i in range(max_length - input_length):
-            # For reasoning mode: use AR for thinking, then switch to diffusion after </thinking>
-            current_mode = mode
-            if mode == "reasoning":
-                # Check if we've generated </thinking>
-                if len(generated_ids) > 0:
-                    # Decode what we have so far
-                    generated_text_so_far = tokenizer.decode(generated_ids, skip_special_tokens=False)
-                    if "</thinking>" in generated_text_so_far:
-                        current_mode = "diffusion"  # Switch to diffusion for final answer
-                        if verbose:
-                            print(f"[reasoning] Switched to diffusion for final answer")
+            outputs = model(input_ids, use_cache=False, mode="ar")
+            logits = outputs["ar_logits"]
             
-            outputs = model(input_ids, use_cache=False, mode=current_mode)
-            # Get logits based on current mode
-            ar_logits = outputs.get("ar_logits")
-            diffusion_logits = outputs.get("diffusion_logits")
-            
-            if mode == "combined" or (mode == "reasoning" and current_mode == "combined"):
-                # Average logits from both modes
-                if ar_logits is not None and diffusion_logits is not None:
-                    logits = (ar_logits + diffusion_logits) / 2
-                elif ar_logits is not None:
-                    logits = ar_logits
-                elif diffusion_logits is not None:
-                    logits = diffusion_logits
-                else:
-                    raise RuntimeError(f"No logits for mode: {mode}")
-            else:
-                logits = ar_logits if ar_logits is not None else diffusion_logits
-                if logits is None:
-                    raise RuntimeError(f"No logits for mode: {mode}")
             next_token_logits = logits[0, -1, :] / temperature
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
@@ -125,27 +93,170 @@ def complete(prompt: str, max_tokens: int = 100, temperature: float = 1.0, top_p
                 sorted_indices_to_remove[..., 0] = 0
                 indices_to_remove = sorted_indices[sorted_indices_to_remove]
                 next_token_logits[indices_to_remove] = float('-inf')
+            
             probs = torch.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
+            
             if first_token_time is None:
                 first_token_time = time.time() - start_time
                 if verbose:
-                    print(f"[{mode}] First token at {first_token_time:.3f}s")
+                    print(f"[ar] First token at {first_token_time:.3f}s")
+            
             if next_token.item() == tokenizer.eos_token_id:
                 break
+            
             generated_ids.append(next_token.item())
             input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
+            
             if verbose:
                 token_text = tokenizer.decode([next_token.item()], skip_special_tokens=True)
-                print(f"[{mode}] {len(generated_ids)}: {token_text!r}")
+                print(f"[ar] {len(generated_ids)}: {token_text!r}")
+    
+    return generated_ids, first_token_time if first_token_time else time.time() - start_time
+
+
+def complete_diffusion(input_ids: torch.Tensor, max_tokens: int, num_steps: int = 10, temperature: float = 1.0, verbose: bool = True) -> tuple:
+    """
+    Generate tokens using diffusion mode (parallel iterative denoising).
+    Much faster than AR since it generates all tokens in parallel and iteratively refines.
+    
+    Args:
+        input_ids: Input token IDs [batch, seq_len]
+        max_tokens: Maximum number of tokens to generate
+        num_steps: Number of denoising steps (fewer = faster, more = better quality)
+        temperature: Sampling temperature
+        verbose: Print progress
+    """
+    batch_size = input_ids.shape[0]
+    input_length = input_ids.shape[1]
+    device = input_ids.device
+    
+    # Create fixed-size sequence with prompt + [MASK] for generation space
+    mask_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id else 0
+    generation_seq = torch.full((batch_size, input_length + max_tokens), mask_token_id, dtype=torch.long, device=device)
+    generation_seq[:, :input_length] = input_ids
+    
+    # Track which positions are masked (need to be predicted)
+    masked_positions = torch.zeros((batch_size, input_length + max_tokens), dtype=torch.bool, device=device)
+    masked_positions[:, input_length:] = True
+    
+    start_time = time.time()
+    
+    with torch.no_grad():
+        # Iterative denoising: in each step, predict some masked tokens
+        num_masked = max_tokens
+        for step in range(num_steps):
+            # Run diffusion head on the entire sequence
+            outputs = model(generation_seq, use_cache=False, mode="diffusion")
+            diffusion_logits = outputs["diffusion_logits"]  # [batch, seq_len, vocab_size]
+            
+            # Apply temperature
+            diffusion_logits = diffusion_logits / temperature
+            
+            # Get predictions for all positions
+            probs = torch.softmax(diffusion_logits, dim=-1)
+            predictions = torch.multinomial(probs.view(-1, probs.shape[-1]), num_samples=1).view(batch_size, -1)
+            
+            # Determine how many tokens to unmask this step
+            # Use cosine schedule: unmask more in early steps, fewer in later steps
+            progress = (step + 1) / num_steps
+            remaining_ratio = 0.5 * (1 + math.cos(math.pi * progress))  # Cosine schedule
+            target_masked = max(1, int(max_tokens * remaining_ratio))
+            num_to_unmask = max(1, num_masked - target_masked)
+            
+            if verbose and step == 0:
+                print(f"[diffusion] Starting denoising with {num_steps} steps, {max_tokens} tokens to generate")
+            
+            # Unmask tokens with highest confidence
+            for b in range(batch_size):
+                masked_indices = masked_positions[b].nonzero(as_tuple=True)[0]
+                if len(masked_indices) == 0:
+                    continue
+                
+                # Get logits for masked positions and compute confidence (max prob)
+                masked_logits = diffusion_logits[b, masked_indices, :]
+                masked_probs = torch.softmax(masked_logits, dim=-1)
+                confidence = masked_probs.max(dim=-1).values
+                
+                # Select top-k confident predictions to unmask
+                k = min(num_to_unmask, len(masked_indices))
+                _, topk_indices = torch.topk(confidence, k)
+                selected_positions = masked_indices[topk_indices]
+                
+                # Unmask selected positions with predicted tokens
+                for pos in selected_positions:
+                    generation_seq[b, pos] = predictions[b, pos]
+                    masked_positions[b, pos] = False
+            
+            num_masked = masked_positions.sum().item()
+            if verbose:
+                print(f"[diffusion] Step {step + 1}/{num_steps}: {max_tokens - num_masked} tokens unmasked, {num_masked} remaining")
+            
+            # Early stopping if all tokens are unmasked
+            if num_masked == 0:
+                if verbose:
+                    print(f"[diffusion] Early stopping at step {step + 1}")
+                break
+    
+    total_time = time.time() - start_time
+    first_token_time = total_time  # For diffusion, all tokens appear "at once"
+    
+    # Extract generated tokens (positions after input_length)
+    generated_ids = generation_seq[0, input_length:].tolist()
+    
+    # Truncate at EOS if present
+    if tokenizer.eos_token_id in generated_ids:
+        eos_pos = generated_ids.index(tokenizer.eos_token_id)
+        generated_ids = generated_ids[:eos_pos]
+    
+    return generated_ids, first_token_time
+
+
+def complete(prompt: str, max_tokens: int = 100, temperature: float = 1.0, top_p: float = 1.0, mode: str = "ar", verbose: bool = True) -> Dict[str, Any]:
+    global model, tokenizer, device
+    if model is None or tokenizer is None:
+        raise RuntimeError("Model not loaded. Call load_model() first.")
+    
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    input_length = input_ids.shape[1]
+    start_time = time.time()
+    
+    if verbose:
+        print(f"[{mode}] Prompt: {prompt[:50]}...")
+        print(f"[{mode}] Input tokens: {input_length}")
+    
+    # Route to appropriate generation method
+    if mode == "ar":
+        generated_ids, first_token_time = complete_ar(
+            input_ids, max_tokens, temperature, top_p, verbose
+        )
+    elif mode == "diffusion":
+        generated_ids, first_token_time = complete_diffusion(
+            input_ids, max_tokens, num_steps=10, temperature=temperature, verbose=verbose
+        )
+    elif mode == "combined":
+        # Use AR for now - combined mode would need special implementation
+        generated_ids, first_token_time = complete_ar(
+            input_ids, max_tokens, temperature, top_p, verbose
+        )
+    elif mode == "reasoning":
+        # Use AR for thinking phase
+        generated_ids, first_token_time = complete_ar(
+            input_ids, max_tokens, temperature, top_p, verbose
+        )
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+    
     generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
     total_time = time.time() - start_time
-    ttft = first_token_time if first_token_time else 0
+    ttft = first_token_time if first_token_time else total_time
     tps = len(generated_ids) / total_time if total_time > 0 else 0
+    
     if verbose:
         print(f"[{mode}] Generated {len(generated_ids)} tokens in {total_time:.2f}s")
         print(f"[{mode}] TTFT: {ttft:.3f}s, TPS: {tps:.2f}")
         print(f"[{mode}] Output: {generated_text[:200]}...")
+    
     return {"text": generated_text, "ttft": ttft, "tps": tps, "total_tokens": len(generated_ids), "finish_reason": "stop" if generated_ids else "length"}
 
 
