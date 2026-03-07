@@ -277,6 +277,25 @@ def complete_medusa(input_ids: torch.Tensor, max_tokens: int, temperature: float
     return generated_ids[:max_tokens], first_token_time if first_token_time else time.time() - start_time
 
 
+def complete_medusa_diffusion(input_ids: torch.Tensor, max_tokens: int, temperature: float, top_p: float, verbose: bool = True) -> tuple:
+    """Hybrid mode: medusa draft first, then diffusion refinement on the drafted span."""
+    # Phase 1: draft with medusa
+    drafted_ids, medusa_ttft = complete_medusa(input_ids.clone(), max_tokens, temperature, top_p, verbose)
+    if len(drafted_ids) == 0:
+        return drafted_ids, medusa_ttft
+
+    # Phase 2: refine drafted span with diffusion
+    draft_tensor = torch.tensor([drafted_ids], device=input_ids.device, dtype=torch.long)
+    refined_ids, _ = complete_diffusion(draft_tensor, max_tokens=len(drafted_ids), num_steps=10, temperature=temperature, verbose=verbose)
+
+    # Keep length consistent with draft for stable behavior
+    final_ids = refined_ids[:len(drafted_ids)] if len(refined_ids) > 0 else drafted_ids
+    if verbose:
+        print(f"[medusa+diffusion] Drafted={len(drafted_ids)} Refined={len(final_ids)}")
+
+    return final_ids, medusa_ttft
+
+
 def complete(prompt: str, max_tokens: int = 100, temperature: float = 1.0, top_p: float = 1.0, mode: str = "ar", verbose: bool = True) -> Dict[str, Any]:
     global model, tokenizer, device
     if model is None or tokenizer is None:
@@ -311,6 +330,10 @@ def complete(prompt: str, max_tokens: int = 100, temperature: float = 1.0, top_p
         )
     elif mode == "medusa":
         generated_ids, first_token_time = complete_medusa(
+            input_ids, max_tokens, temperature, top_p, verbose
+        )
+    elif mode == "medusa+diffusion":
+        generated_ids, first_token_time = complete_medusa_diffusion(
             input_ids, max_tokens, temperature, top_p, verbose
         )
     else:
@@ -461,7 +484,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens to generate")
     parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     parser.add_argument("--top-p", type=float, default=1.0, help="Nucleus sampling")
-    parser.add_argument("--mode", type=str, default="ar", choices=["ar", "diffusion", "combined", "reasoning", "medusa"], help="Generation mode: ar=auto-regressive, diffusion=masked, combined=avg both, reasoning=AR then diffusion, medusa=mtp speculative decoding")
+    parser.add_argument("--mode", type=str, default="ar", choices=["ar", "diffusion", "combined", "reasoning", "medusa", "medusa+diffusion"], help="Generation mode: ar=auto-regressive, diffusion=masked, combined=avg both, reasoning=AR then diffusion, medusa=mtp speculative decoding, medusa+diffusion=medusa draft then diffusion refine")
     parser.add_argument("--use-tools", action="store_true", help="Enable tool calling mode")
     parser.add_argument("--max-tool-cycles", type=int, default=3, help="Max tool call cycles in tool mode")
     parser.add_argument("--quiet", action="store_true", help="Suppress verbose output")
