@@ -77,11 +77,26 @@ def _estimate_params(config: Dict[str, Any]) -> int:
 
 
 def _normalize_heads(hidden_size: int, preferred_heads: int) -> Tuple[int, int]:
-    """Return (num_heads, head_dim) with hidden_size divisible by num_heads."""
+    """Return (num_heads, head_dim) with hidden_size divisible by num_heads and even head_dim for RoPE."""
     num_heads = max(1, min(preferred_heads, hidden_size))
     while hidden_size % num_heads != 0 and num_heads > 1:
         num_heads -= 1
+
     head_dim = hidden_size // num_heads
+    if head_dim % 2 != 0:
+        # Prefer reducing heads so head_dim becomes even while preserving divisibility.
+        found = False
+        for nh in range(num_heads - 1, 0, -1):
+            if hidden_size % nh == 0 and ((hidden_size // nh) % 2 == 0):
+                num_heads = nh
+                head_dim = hidden_size // nh
+                found = True
+                break
+        if not found:
+            # Fallback: bump hidden size minimally to make head_dim even
+            hidden_size += num_heads
+            head_dim = hidden_size // num_heads
+
     return num_heads, head_dim
 
 

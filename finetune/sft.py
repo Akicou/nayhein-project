@@ -388,12 +388,22 @@ class SFTTrainer(BaseFinetuner):
             if base_vocab is None:
                 base_vocab = model_cfg.get("vocab_size", 16001) - 1
 
+            hidden_size = model_cfg.get("hidden_size", 256)
+            num_heads = model_cfg.get("num_heads", 4)
+            head_dim = model_cfg.get("head_dim", 64)
+            if head_dim % 2 != 0:
+                # RoPE requires even head_dim because rotate_half splits the last dim in half.
+                if hidden_size % num_heads == 0 and (hidden_size // num_heads) % 2 == 0:
+                    head_dim = hidden_size // num_heads
+                else:
+                    head_dim = head_dim + 1
+
             base_model = DualModeModel(
                 vocab_size=base_vocab,
-                hidden_size=model_cfg.get("hidden_size", 256),
+                hidden_size=hidden_size,
                 num_layers=model_cfg.get("num_layers", 6),
-                num_heads=model_cfg.get("num_heads", 4),
-                head_dim=model_cfg.get("head_dim", 64),
+                num_heads=num_heads,
+                head_dim=head_dim,
                 mlp_ratio=model_cfg.get("mlp_ratio", 4.0),
                 max_seq_len=model_cfg.get("max_seq_len", 4096),
                 mtp_enabled=model_cfg.get("mtp_enabled", False),
