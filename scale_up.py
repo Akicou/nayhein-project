@@ -350,6 +350,15 @@ def scale_model_depth(
 ) -> DualModeModel:
     """Scale model by stacking more layers."""
     
+    # Get mlp_ratio from model if available, otherwise compute from gate_proj
+    if hasattr(model, 'mlp_ratio'):
+        mlp_ratio = model.mlp_ratio
+    elif len(model.layers) > 0 and hasattr(model.layers[0], 'mlp'):
+        # Compute from gate_proj out_features / hidden_size
+        mlp_ratio = model.layers[0].mlp.gate_proj.out_features / model.hidden_size
+    else:
+        mlp_ratio = 4.0
+    
     # Create new model with more layers
     new_model = DualModeModel(
         vocab_size=model.vocab_size,
@@ -357,7 +366,7 @@ def scale_model_depth(
         num_layers=new_num_layers,
         num_heads=model.num_heads,
         head_dim=model.head_dim,
-        mlp_ratio=model.layers[0].mlp.hidden_size / model.hidden_size if hasattr(model.layers[0], 'mlp') else 4.0,
+        mlp_ratio=mlp_ratio,
         max_seq_len=model.max_seq_len,
     )
     
