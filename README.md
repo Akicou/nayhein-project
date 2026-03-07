@@ -64,15 +64,29 @@ python pretrain.py \
   --wandb-project my-pretrain
 ```
 
-### Dev Branch Changes (Diffusion Training Fixes)
+### Dev Branch Changes (Diffusion + Multi-GPU)
 
-The `dev` branch includes targeted fixes to make diffusion training behavior consistent with masked-denoising training:
+The `dev` branch includes targeted fixes and training improvements:
 
 - Added a dedicated mask token in model vocabulary (`mask_token_id`) and persisted it in checkpoint config
 - Added diffusion noising during training via random token masking (`diffusion_mask_prob`)
 - Changed diffusion loss to train only on masked positions (non-masked positions are ignored)
 - Kept AR training causal while diffusion mode uses bidirectional context behavior
 - Updated inference/checkpoint loading to correctly reconstruct original vocab + mask token handling
+- Added optional multi-GPU pretraining support via Hugging Face Accelerate (`--use-accelerate`)
+- Added distributed-safe logging/checkpointing/saving behavior (main process only)
+
+### Multi-GPU Pretraining (Accelerate)
+
+Run single-node multi-GPU pretraining with:
+
+```bash
+# 2 GPUs
+accelerate launch --num_processes 2 pretrain.py --use-accelerate --mixed-precision bf16 --loss-mode both
+
+# 4 GPUs
+accelerate launch --num_processes 4 pretrain.py --use-accelerate --mixed-precision bf16 --loss-mode both
+```
 
 ### Recommended Training Profiles (10M / 50M / 150M)
 
@@ -82,7 +96,15 @@ Use these as starting points for `pretrain.py`:
 |---|---|
 | ~10M | `--hidden-size 256 --num-layers 6 --num-heads 4 --head-dim 64 --batch-size 64 --seq-len 512 --lr 1e-4 --warmup-steps 200 --loss-mode both --gradient-checkpointing` |
 | ~50M | `--hidden-size 512 --num-layers 10 --num-heads 8 --head-dim 64 --batch-size 32 --seq-len 1024 --lr 1e-4 --warmup-steps 500 --loss-mode both --gradient-checkpointing --accumulation-steps 2` |
-| ~150M | `--hidden-size 768 --num-layers 14 --num-heads 12 --head-dim 64 --batch-size 16 --seq-len 1024 --lr 8e-5 --warmup-steps 1000 --loss-mode both --gradient-checkpointing --accumulation-steps 4` |
+| ~150M | `--hidden-size 768 --num-layers 14 --num-heads 12 --head-dim 64 --batch-size 16 --seq-len 2048 --lr 8e-5 --warmup-steps 1000 --loss-mode both --gradient-checkpointing --accumulation-steps 4` |
+
+### Recommended Context Windows by Model Size
+
+| Target Params | Recommended `--seq-len` | Notes |
+|---|---:|---|
+| ~10M | 512 | Most stable and efficient for small models |
+| ~50M | 1024 | Good tradeoff between context and throughput |
+| ~150M | 1024–2048 | Prefer 2048 if memory budget allows |
 
 ### Recommended Data Scale by Model Size
 
@@ -104,7 +126,7 @@ python pretrain.py --hidden-size 256 --num-layers 6 --num-heads 4 --head-dim 64 
 python pretrain.py --hidden-size 512 --num-layers 10 --num-heads 8 --head-dim 64 --batch-size 32 --seq-len 1024 --lr 1e-4 --warmup-steps 500 --loss-mode both --gradient-checkpointing --accumulation-steps 2
 
 # ~150M profile
-python pretrain.py --hidden-size 768 --num-layers 14 --num-heads 12 --head-dim 64 --batch-size 16 --seq-len 1024 --lr 8e-5 --warmup-steps 1000 --loss-mode both --gradient-checkpointing --accumulation-steps 4
+python pretrain.py --hidden-size 768 --num-layers 14 --num-heads 12 --head-dim 64 --batch-size 16 --seq-len 2048 --lr 8e-5 --warmup-steps 1000 --loss-mode both --gradient-checkpointing --accumulation-steps 4
 ```
 
 ### Inference

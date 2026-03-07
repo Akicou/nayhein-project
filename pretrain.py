@@ -54,6 +54,14 @@ try:
 except ImportError:
     HAS_WANDB = False
 
+# Try to import Accelerate
+try:
+    from accelerate import Accelerator
+    HAS_ACCELERATE = True
+except ImportError:
+    Accelerator = None
+    HAS_ACCELERATE = False
+
 # Try to import Flash Attention 2
 try:
     from flash_attn import flash_attn_func
@@ -791,6 +799,7 @@ def train_epoch(
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
     config: TrainingConfig,
     epoch: int,
+    accelerator=None,
 ) -> dict:
     """Train for one epoch."""
     model.train()
@@ -800,11 +809,13 @@ def train_epoch(
     total_diffusion_loss = 0.0
     num_batches = 0
     
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    is_main_process = accelerator is None or accelerator.is_main_process
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=not is_main_process)
     optimizer.zero_grad()
     
     for batch_idx, batch in enumerate(pbar):
-        batch = batch.to(config.device)
+        if accelerator is None:
+            batch = batch.to(config.device)
         
         # Forward pass
         outputs = model(batch, labels=batch, mode=config.loss_mode, is_training=True)
@@ -824,23 +835,41 @@ def train_epoch(
         loss = loss / config.accumulation_steps
         
         # Backward pass
-        loss.backward()
+        if accelerator is not None:
+            accelerator.backward(loss)
+        else:
+            loss.backward()
         
         # Update weights
         if (batch_idx + 1) % config.accumulation_steps == 0:
             if config.use_gradient_checkpointing:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if accelerator is not None:
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
             if scheduler is not None:
                 scheduler.step()
         
         # Logging
-        total_loss += loss.item() * config.accumulation_steps
+        loss_value = loss.item() * config.accumulation_steps
+        ar_loss_value = outputs["ar_loss"].item() if outputs.get("ar_loss") is not None else 0.0
+        diffusion_loss_value = outputs["diffusion_loss"].item() if outputs.get("diffusion_loss") is not None else 0.0
+        
+        if accelerator is not None:
+            loss_tensor = torch.tensor(loss_value, device=outputs["ar_logits"].device if outputs.get("ar_logits") is not None else outputs["diffusion_logits"].device)
+            ar_loss_tensor = torch.tensor(ar_loss_value, device=loss_tensor.device)
+            diffusion_loss_tensor = torch.tensor(diffusion_loss_value, device=loss_tensor.device)
+            loss_value = accelerator.gather_for_metrics(loss_tensor).mean().item()
+            ar_loss_value = accelerator.gather_for_metrics(ar_loss_tensor).mean().item()
+            diffusion_loss_value = accelerator.gather_for_metrics(diffusion_loss_tensor).mean().item()
+        
+        total_loss += loss_value
         if outputs.get("ar_loss") is not None:
-            total_ar_loss += outputs["ar_loss"].item()
+            total_ar_loss += ar_loss_value
         if outputs.get("diffusion_loss") is not None:
-            total_diffusion_loss += outputs["diffusion_loss"].item()
+            total_diffusion_loss += diffusion_loss_value
         num_batches += 1
         
         pbar.set_postfix({
@@ -850,31 +879,35 @@ def train_epoch(
         
         # Log to wandb
         if config.wandb_project and HAS_WANDB and batch_idx % config.log_interval == 0:
-            wandb.log({
-                "train/loss": total_loss / num_batches,
-                "train/ar_loss": total_ar_loss / max(1, num_batches),
-                "train/diffusion_loss": total_diffusion_loss / max(1, num_batches),
-                "train/lr": optimizer.param_groups[0]["lr"],
-                "train/step": epoch * len(dataloader) + batch_idx,
-            })
+            if accelerator is None or accelerator.is_main_process:
+                wandb.log({
+                    "train/loss": total_loss / num_batches,
+                    "train/ar_loss": total_ar_loss / max(1, num_batches),
+                    "train/diffusion_loss": total_diffusion_loss / max(1, num_batches),
+                    "train/lr": optimizer.param_groups[0]["lr"],
+                    "train/step": epoch * len(dataloader) + batch_idx,
+                })
     
+    denom = max(1, num_batches)
     return {
-        "loss": total_loss / num_batches,
-        "ar_loss": total_ar_loss / num_batches if total_ar_loss > 0 else None,
-        "diffusion_loss": total_diffusion_loss / num_batches if total_diffusion_loss > 0 else None,
+        "loss": total_loss / denom,
+        "ar_loss": total_ar_loss / denom if total_ar_loss > 0 else None,
+        "diffusion_loss": total_diffusion_loss / denom if total_diffusion_loss > 0 else None,
     }
 
 
-def evaluate(model: nn.Module, dataloader: DataLoader, config: TrainingConfig) -> dict:
+def evaluate(model: nn.Module, dataloader: DataLoader, config: TrainingConfig, accelerator=None) -> dict:
     """Evaluate the model."""
     model.eval()
     
     total_loss = 0.0
     num_batches = 0
+    is_main_process = accelerator is None or accelerator.is_main_process
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            batch = batch.to(config.device)
+        for batch in tqdm(dataloader, desc="Evaluating", disable=not is_main_process):
+            if accelerator is None:
+                batch = batch.to(config.device)
             outputs = model(batch, labels=batch, mode=config.loss_mode, is_training=False)
             
             if config.loss_mode == "both":
@@ -885,33 +918,42 @@ def evaluate(model: nn.Module, dataloader: DataLoader, config: TrainingConfig) -
             else:
                 loss = outputs.get("ar_loss", 0)
             
-            total_loss += loss.item()
+            loss_value = loss.item()
+            if accelerator is not None:
+                loss_tensor = torch.tensor(loss_value, device=outputs["ar_logits"].device if outputs.get("ar_logits") is not None else outputs["diffusion_logits"].device)
+                loss_value = accelerator.gather_for_metrics(loss_tensor).mean().item()
+            total_loss += loss_value
             num_batches += 1
     
-    return {"loss": total_loss / num_batches}
+    return {"loss": total_loss / max(1, num_batches)}
 
 
-def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, scheduler, epoch: int, step: int, config: TrainingConfig):
+def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, scheduler, epoch: int, step: int, config: TrainingConfig, accelerator=None):
     """Save model checkpoint."""
     os.makedirs(config.output_dir, exist_ok=True)
+    
+    if accelerator is not None and not accelerator.is_main_process:
+        return
     
     # Save model checkpoint
     save_path = Path(config.output_dir) / f"checkpoint-epoch{epoch}-step{step}"
     save_path.mkdir(exist_ok=True)
     
+    unwrapped_model = accelerator.unwrap_model(model) if accelerator is not None else model
+    
     # Save model state dict (plain PyTorch)
-    torch.save(model.state_dict(), save_path / "model.pt")
+    torch.save(unwrapped_model.state_dict(), save_path / "model.pt")
     
     # Save model config
     config_dict = {
-        "vocab_size": model.vocab_size,
-        "original_vocab_size": model.original_vocab_size,
-        "mask_token_id": model.mask_token_id,
-        "hidden_size": model.hidden_size,
-        "num_layers": model.num_layers,
-        "num_heads": model.num_heads,
-        "head_dim": model.head_dim,
-        "max_seq_len": model.max_seq_len,
+        "vocab_size": unwrapped_model.vocab_size,
+        "original_vocab_size": unwrapped_model.original_vocab_size,
+        "mask_token_id": unwrapped_model.mask_token_id,
+        "hidden_size": unwrapped_model.hidden_size,
+        "num_layers": unwrapped_model.num_layers,
+        "num_heads": unwrapped_model.num_heads,
+        "head_dim": unwrapped_model.head_dim,
+        "max_seq_len": unwrapped_model.max_seq_len,
     }
     torch.save(config_dict, save_path / "config.pt")
     
@@ -923,7 +965,8 @@ def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, schedule
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
     }, save_path / "trainer_state.pt")
     
-    print(f"Saved checkpoint to {save_path}")
+    if accelerator is None or accelerator.is_main_process:
+        print(f"Saved checkpoint to {save_path}")
 
 
 # ============================================================================
@@ -967,6 +1010,7 @@ def main():
     
     # Logging
     parser.add_argument("--wandb-project", type=str, default=None, help="WandB project name")
+    parser.add_argument("--use-accelerate", action="store_true", help="Enable accelerate-based multi-GPU training")
     
     args = parser.parse_args()
     
@@ -999,12 +1043,22 @@ def main():
         wandb_project=args.wandb_project,
     )
     
-    # Initialize wandb
-    if config.wandb_project and HAS_WANDB:
-        wandb.init(project=config.wandb_project, config=vars(config))
+    # Setup accelerator (optional multi-GPU)
+    accelerator = None
+    if args.use_accelerate:
+        if not HAS_ACCELERATE:
+            raise ImportError("accelerate is not installed. Install it via: pip install accelerate")
+        accelerator = Accelerator(mixed_precision=config.mixed_precision if config.mixed_precision != "fp32" else "no")
+        device = accelerator.device
+        config.device = str(device)
+    else:
+        device = torch.device(config.device)
     
-    # Set device
-    device = torch.device(config.device)
+    # Initialize wandb (main process only)
+    if config.wandb_project and HAS_WANDB:
+        if accelerator is None or accelerator.is_main_process:
+            wandb.init(project=config.wandb_project, config=vars(config))
+    
     print(f"Using device: {device}")
     
     # Create model
@@ -1016,6 +1070,7 @@ def main():
     print(f"Head dim: {config.head_dim}")
     print(f"Flash Attention: {config.use_flash_attention}")
     
+    tokenizer = None
     model = DualModeModel(
         vocab_size=config.vocab_size,
         hidden_size=config.hidden_size,
@@ -1108,42 +1163,67 @@ def main():
     # Create optimizer
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
     
+    # Prepare for multi-GPU training (if enabled)
+    if accelerator is not None:
+        if val_loader is not None:
+            model, optimizer, train_loader, val_loader = accelerator.prepare(model, optimizer, train_loader, val_loader)
+        else:
+            model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    
     # Create scheduler
     num_training_steps = len(train_loader) * config.epochs // config.accumulation_steps
     scheduler = get_linear_schedule_with_warmup(optimizer, config.warmup_steps, num_training_steps)
     
     # Training loop
-    print("\n=== Starting Training ===")
+    if accelerator is None or accelerator.is_main_process:
+        print("\n=== Starting Training ===")
     global_step = 0
     
     for epoch in range(config.epochs):
-        train_metrics = train_epoch(model, train_loader, optimizer, scheduler, config, epoch)
-        print(f"Epoch {epoch}: {train_metrics}")
+        train_metrics = train_epoch(model, train_loader, optimizer, scheduler, config, epoch, accelerator=accelerator)
+        if accelerator is None or accelerator.is_main_process:
+            print(f"Epoch {epoch}: {train_metrics}")
         
         # Save checkpoint
-        save_checkpoint(model, optimizer, scheduler, epoch, global_step, config)
+        save_checkpoint(model, optimizer, scheduler, epoch, global_step, config, accelerator=accelerator)
         
         # Evaluate
         if val_loader is not None and (epoch + 1) % config.eval_interval == 0:
-            eval_metrics = evaluate(model, val_loader, config)
-            print(f"Evaluation: {eval_metrics}")
-            
-            if config.wandb_project and HAS_WANDB:
-                wandb.log({"eval/loss": eval_metrics["loss"]})
+            eval_metrics = evaluate(model, val_loader, config, accelerator=accelerator)
+            if accelerator is None or accelerator.is_main_process:
+                print(f"Evaluation: {eval_metrics}")
+                
+                if config.wandb_project and HAS_WANDB:
+                    wandb.log({"eval/loss": eval_metrics["loss"]})
         
         global_step += len(train_loader)
     
     # Final save
-    save_path = Path(config.output_dir) / "final"
-    save_path.mkdir(exist_ok=True)
-    model.save_pretrained(save_path)
-    print(f"\nFinal model saved to {save_path}")
-    
-    # Log model size
-    print(f"\n=== Final Model Statistics ===")
-    print(f"Total parameters: {model.get_num_params():,}")
-    print(f"AR head parameters: {sum(p.numel() for p in model.ar_head.parameters()):,}")
-    print(f"Diffusion head parameters: {sum(p.numel() for p in model.diffusion_head.parameters()):,}")
+    if accelerator is None or accelerator.is_main_process:
+        save_path = Path(config.output_dir) / "final"
+        save_path.mkdir(exist_ok=True)
+        model_to_save = accelerator.unwrap_model(model) if accelerator is not None else model
+        if hasattr(model_to_save, "save_pretrained"):
+            model_to_save.save_pretrained(save_path)
+        else:
+            torch.save(model_to_save.state_dict(), save_path / "model.pt")
+            torch.save({
+                "vocab_size": model_to_save.vocab_size,
+                "original_vocab_size": model_to_save.original_vocab_size,
+                "mask_token_id": model_to_save.mask_token_id,
+                "hidden_size": model_to_save.hidden_size,
+                "num_layers": model_to_save.num_layers,
+                "num_heads": model_to_save.num_heads,
+                "head_dim": model_to_save.head_dim,
+                "max_seq_len": model_to_save.max_seq_len,
+            }, save_path / "config.pt")
+        print(f"\nFinal model saved to {save_path}")
+        
+        # Log model size
+        print(f"\n=== Final Model Statistics ===")
+        print(f"Total parameters: {model_to_save.get_num_params():,}")
+        print(f"AR head parameters: {sum(p.numel() for p in model_to_save.ar_head.parameters()):,}")
+        print(f"Diffusion head parameters: {sum(p.numel() for p in model_to_save.diffusion_head.parameters()):,}")
 
 
 if __name__ == "__main__":
