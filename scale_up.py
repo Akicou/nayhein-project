@@ -323,11 +323,12 @@ def scale_model_width(
         new_model.final_layernorm.weight.data = model.final_layernorm.weight.data.clone()
         new_model.final_layernorm.bias.data = model.final_layernorm.bias.data.clone()
         
-        # Scale AR head
-        new_model.ar_head = expand_linear_layer(
+        # Scale AR head - expand the lm_head inside ARHead
+        new_ar_head_lm_head = expand_linear_layer(
             model.ar_head.lm_head,
             new_in_features=new_config["hidden_size"],
         )
+        new_model.ar_head.lm_head = new_ar_head_lm_head
         
         # Scale diffusion head
         new_model.diffusion_head.dense = expand_linear_layer(
@@ -421,14 +422,17 @@ def scale_model_depth(
         
         # Copy heads
         new_model.ar_head.lm_head.weight.data = model.ar_head.lm_head.weight.data.clone()
-        new_model.ar_head.lm_head.bias.data = model.ar_head.lm_head.bias.data.clone()
+        if model.ar_head.lm_head.bias is not None:
+            new_model.ar_head.lm_head.bias.data = model.ar_head.lm_head.bias.data.clone()
         
         new_model.diffusion_head.dense.weight.data = model.diffusion_head.dense.weight.data.clone()
-        new_model.diffusion_head.dense.bias.data = model.diffusion_head.dense.bias.data.clone()
+        if model.diffusion_head.dense.bias is not None:
+            new_model.diffusion_head.dense.bias.data = model.diffusion_head.dense.bias.data.clone()
         new_model.diffusion_head.layer_norm.weight.data = model.diffusion_head.layer_norm.weight.data.clone()
         new_model.diffusion_head.layer_norm.bias.data = model.diffusion_head.layer_norm.bias.data.clone()
         new_model.diffusion_head.decoder.weight.data = model.diffusion_head.decoder.weight.data.clone()
-        new_model.diffusion_head.decoder.bias.data = model.diffusion_head.decoder.bias.data.clone()
+        if model.diffusion_head.decoder.bias is not None:
+            new_model.diffusion_head.decoder.bias.data = model.diffusion_head.decoder.bias.data.clone()
     
     return new_model
 
