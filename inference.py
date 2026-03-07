@@ -54,9 +54,24 @@ def complete(prompt: str, max_tokens: int = 100, temperature: float = 1.0, top_p
     with torch.no_grad():
         for i in range(max_length - input_length):
             outputs = model(input_ids, use_cache=False, mode=mode)
-            logits = outputs.get("ar_logits", outputs.get("diffusion_logits"))
-            if logits is None:
-                raise RuntimeError(f"No logits for mode: {mode}")
+            # Get logits based on mode
+            ar_logits = outputs.get("ar_logits")
+            diffusion_logits = outputs.get("diffusion_logits")
+            
+            if mode == "combined":
+                # Average logits from both modes
+                if ar_logits is not None and diffusion_logits is not None:
+                    logits = (ar_logits + diffusion_logits) / 2
+                elif ar_logits is not None:
+                    logits = ar_logits
+                elif diffusion_logits is not None:
+                    logits = diffusion_logits
+                else:
+                    raise RuntimeError(f"No logits for mode: {mode}")
+            else:
+                logits = ar_logits if ar_logits is not None else diffusion_logits
+                if logits is None:
+                    raise RuntimeError(f"No logits for mode: {mode}")
             next_token_logits = logits[0, -1, :] / temperature
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
