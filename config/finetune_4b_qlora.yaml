@@ -1,0 +1,59 @@
+# Low-VRAM SFT config for scaled 4B model (QLoRA mode)
+# Designed for ~4-8GB VRAM usage on 4B parameter models
+
+finetune:
+  type: sft
+
+model:
+  model_path: ./checkpoints/4b_scaled
+  tokenizer_path: null
+
+data:
+  train_data_path: null
+  eval_data_path: null
+  hf_dataset_name: null
+  hf_train_split: train
+  hf_eval_split: null
+  hf_conversation_column: conversation_a
+  hf_max_samples: null
+
+training:
+  epochs: 3
+  batch_size: 1
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 100
+  gradient_accumulation_steps: 16
+  max_seq_length: 1024
+  max_grad_norm: 1.0
+
+lora:
+  use_lora: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+quantization:
+  use_qlora: true
+  quantization_bits: 4
+  quantization_compute_dtype: bfloat16
+
+save:
+  output_dir: ./checkpoints/finetuned_4b_qlora
+  save_mode: adapter
+
+runtime:
+  use_gradient_checkpointing: true
+  mixed_precision: bf16
+  log_interval: 10
+  eval_interval: 500
+  save_interval: 1000
+  wandb_project: null

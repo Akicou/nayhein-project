@@ -188,9 +188,62 @@ class BaseFinetuner(ABC):
 
         return model
     
+    def _check_large_model_safety(self, model_path: str) -> None:
+        """Check if model is large and warn about VRAM requirements."""
+        try:
+            config_file = Path(model_path) / "config.pt"
+            hf_config_file = Path(model_path) / "config.json"
+            
+            param_count = None
+            if config_file.exists():
+                custom_cfg = torch.load(config_file, map_location="cpu")
+                model_cfg = custom_cfg.get("target_config", custom_cfg)
+                hidden_size = model_cfg.get("hidden_size", 256)
+                num_layers = model_cfg.get("num_layers", 6)
+                num_heads = model_cfg.get("num_heads", 4)
+                vocab_size = model_cfg.get("vocab_size", 16001)
+                
+                mlp_dim = int(hidden_size * model_cfg.get("mlp_ratio", 4.0))
+                attn_dim = num_heads * model_cfg.get("head_dim", hidden_size // max(1, num_heads))
+                
+                embed_params = vocab_size * hidden_size
+                layer_params = num_layers * (4 * hidden_size * attn_dim + 3 * hidden_size * mlp_dim)
+                head_params = 2 * hidden_size * vocab_size
+                param_count = embed_params + layer_params + head_params
+                
+            elif hf_config_file.exists():
+                import json
+                with open(hf_config_file, "r") as f:
+                    cfg = json.load(f)
+                hidden_size = cfg.get("hidden_size", 256)
+                num_layers = cfg.get("num_hidden_layers", 6)
+                vocab_size = cfg.get("vocab_size", 32000)
+                intermediate_size = cfg.get("intermediate_size", hidden_size * 4)
+                
+                embed_params = vocab_size * hidden_size
+                layer_params = num_layers * (12 * hidden_size * hidden_size + 3 * hidden_size * intermediate_size)
+                head_params = hidden_size * vocab_size
+                param_count = embed_params + layer_params + head_params
+            
+            if param_count is not None and param_count > 1e9:
+                param_gb = param_count * 2 / (1024 ** 3)
+                qlora_gb = param_count * 0.5 / (1024 ** 3)
+                print("=" * 60)
+                print(f"LARGE MODEL DETECTED: ~{param_count / 1e9:.2f}B parameters")
+                print(f"  Full BF16 baseline: ~{param_gb:.1f} GB VRAM (weights only)")
+                print(f"  QLoRA 4-bit: ~{qlora_gb:.1f} GB VRAM (recommended)")
+                if not getattr(self.config, "use_qlora", False):
+                    print("WARNING: QLoRA not enabled! Consider --use-qlora or use_lora=true + use_qlora=true in YAML")
+                    print("         to significantly reduce VRAM usage on multi-billion parameter models.")
+                print("=" * 60)
+        except Exception as e:
+            pass
+    
     def setup_training(self):
         """Setup training infrastructure."""
-        # Setup tokenizer
+        if Path(self.config.model_path).exists() and getattr(self.config, "use_qlora", False):
+            self._check_large_model_safety(self.config.model_path)
+        
         self.setup_tokenizer()
         
         # Setup model

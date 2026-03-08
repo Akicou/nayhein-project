@@ -439,16 +439,68 @@ class SFTTrainer(BaseFinetuner):
         super().__init__(config)
         self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
     
+    def _estimate_vram_mb(self, param_count: int, dtype_bytes: int) -> float:
+        """Estimate VRAM in MB for given parameter count and dtype."""
+        return (param_count * dtype_bytes) / (1024 ** 2)
+    
+    def _report_memory_estimate(self, model: nn.Module, use_qlora: bool) -> None:
+        """Print estimated memory requirements."""
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        
+        if use_qlora:
+            base_bytes = 0.5
+            print(f"QLoRA mode: ~{self._estimate_vram_mb(total_params, base_bytes):.1f} MB base (4-bit), trainable: {trainable_params:,}")
+        else:
+            bf16_bytes = 2
+            print(f"Full/BF16 mode: ~{self._estimate_vram_mb(total_params, bf16_bytes):.1f} MB base (bf16), trainable: {total_params:,}")
+    
     def setup_model(self) -> PreTrainedModel:
         """Setup model for SFT."""
         print(f"Loading model from {self.config.model_path}")
 
         if self._is_custom_checkpoint_dir(self.config.model_path):
             if self.config.use_qlora:
-                raise ValueError("QLoRA is only supported for Hugging Face model directories in this trainer")
+                hf_export_dir = Path(self.config.model_path) / "hf_format"
+                if not hf_export_dir.exists():
+                    from tools.export_hf_format import export_dualmode_to_hf
+                    print(f"Exporting custom checkpoint to HF format for QLoRA: {hf_export_dir}")
+                    export_dualmode_to_hf(self.config.model_path, hf_export_dir)
+                model_path_hf = str(hf_export_dir)
+                print(f"Loading HF-format model with 4-bit quantization: {model_path_hf}")
+                compute_dtype = torch.bfloat16 if self.config.quantization_compute_dtype == "bfloat16" else torch.float16
+                qconfig = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=compute_dtype,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                )
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_path_hf,
+                    quantization_config=qconfig,
+                    torch_dtype=compute_dtype,
+                    device_map=self.config.device,
+                    trust_remote_code=True,
+                )
+                if self.config.use_gradient_checkpointing:
+                    model.gradient_checkpointing_enable()
+                from peft import prepare_model_for_kbit_training
+                model = prepare_model_for_kbit_training(model)
+                peft_config = LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    r=self.config.lora_r,
+                    lora_alpha=self.config.lora_alpha,
+                    lora_dropout=self.config.lora_dropout,
+                    target_modules=self.config.lora_target_modules or ["q_proj", "v_proj", "k_proj", "o_proj"],
+                    bias="none",
+                    inference_mode=False,
+                )
+                model = get_peft_model(model, peft_config)
+                model.print_trainable_parameters()
+                self._report_memory_estimate(model, use_qlora=True)
+                return model
+            
             custom_cfg = torch.load(Path(self.config.model_path) / "config.pt", map_location="cpu")
-
-            # Handle both pretrain checkpoint config and scale_up config wrappers
             model_cfg = custom_cfg.get("target_config", custom_cfg)
             base_vocab = model_cfg.get("original_vocab_size")
             if base_vocab is None:
@@ -460,7 +512,6 @@ class SFTTrainer(BaseFinetuner):
             num_heads = model_cfg.get("num_heads", 4)
             head_dim = model_cfg.get("head_dim", 64)
             if head_dim % 2 != 0:
-                # RoPE requires even head_dim because rotate_half splits the last dim in half.
                 if hidden_size % num_heads == 0 and (hidden_size // num_heads) % 2 == 0:
                     head_dim = hidden_size // num_heads
                 else:
@@ -480,7 +531,6 @@ class SFTTrainer(BaseFinetuner):
             )
             state_dict = torch.load(Path(self.config.model_path) / "model.pt", map_location="cpu")
 
-            # Load what matches exactly, then overlap-copy mismatched tensors (for older scaled checkpoints)
             model_state = base_model.state_dict()
             exact_state = {}
             mismatched = []
@@ -509,6 +559,8 @@ class SFTTrainer(BaseFinetuner):
             )
             if self.config.use_lora:
                 model.print_trainable_parameters()
+            else:
+                self._report_memory_estimate(model, use_qlora=False)
             model._is_custom_dualmode = True
             return model
 

@@ -246,6 +246,26 @@ output = model.generate(prompt, max_length=50000)
 
 ### Phase 3: SFT Finetuning
 
+**Low-VRAM QLoRA Finetuning** (Recommended for 4B+ models)
+
+Finetune your scaled model with QLoRA 4-bit quantization, reducing VRAM usage from ~70GB to ~3-5GB:
+
+```bash
+# Using YAML config (recommended)
+python -m finetune --config config/finetune_4b_qlora.yaml
+
+# Or with CLI flags
+python -m finetune.sft \
+  --model-path ./checkpoints/4b_scaled \
+  --use-lora \
+  --use-qlora \
+  --lora-r 16 \
+  --save-mode adapter \
+  --use-gradient-checkpointing
+```
+
+**Standard SFT** (for smaller models with sufficient VRAM):
+
 ```bash
 python -m finetune.sft \
   --model-path ./checkpoints/4b_scaled \
@@ -257,6 +277,24 @@ python -m finetune.sft \
 ```
 
 ### Phase 4: DPO (Optional)
+
+**Low-VRAM QLoRA DPO**:
+
+```bash
+# Using YAML config
+python -m finetune --config config/finetune_dpo_qlora.yaml
+
+# Or with CLI flags
+python -m finetune.dpo \
+  --model-path ./checkpoints/4b_sft \
+  --data-path ./data/preference.json \
+  --output-dir ./checkpoints/4b_dpo \
+  --use-qlora \
+  --beta 0.1 \
+  --reference-free
+```
+
+**Standard DPO**:
 
 ```bash
 python -m finetune.dpo \
@@ -333,6 +371,16 @@ class MyModelWrapper(ToolCallingMixin):
 
 See `config/` for example configuration files:
 
+### YAML Configs (Recommended)
+
+| Config | Purpose | VRAM Usage |
+|--------|---------|------------|
+| `finetune_4b_qlora.yaml` | QLoRA SFT for 4B models | ~3-5 GB |
+| `finetune_dpo_qlora.yaml` | QLoRA DPO for 4B models | ~3-5 GB |
+| `finetune_default.yaml` | Standard LoRA SFT | ~8-24 GB |
+
+### JSON Configs (Legacy)
+
 - `pretrain_10m.json` - 10M parameter pretraining config
 - `scale_1b.json` - Scale to 1B config
 - `scale_4b.json` - Scale to 4B config
@@ -370,6 +418,19 @@ Model scaling script with support for width, depth, and combined scaling.
 - `--method`: Scaling method (width, depth, width+depth)
 - `--interpolate-pos-embeddings`: Position embedding interpolation
 
+### finetune/
+
+Unified finetuning entrypoint:
+
+```bash
+# With YAML config
+python -m finetune --config config/finetune_4b_qlora.yaml
+
+# Or use specific trainers
+python -m finetune.sft  # SFT
+python -m finetune.dpo  # DPO
+```
+
 ### finetune/sft.py
 
 SFT trainer with LoRA/QLoRA support.
@@ -379,8 +440,10 @@ SFT trainer with LoRA/QLoRA support.
 - `--model-path`: Model to finetune
 - `--data-path`: Training data
 - `--use-lora`: Enable LoRA
-- `--use-qlora`: Enable QLoRA
+- `--use-qlora`: Enable QLoRA (4-bit quantization)
 - `--lora-r`: LoRA rank
+- `--save-mode`: `adapter` (LoRA only) or `merged`
+- `--config`: Path to YAML config file
 
 ### finetune/dpo.py
 
@@ -392,6 +455,8 @@ DPO trainer for preference optimization.
 - `--data-path`: Preference data
 - `--beta`: KL penalty coefficient
 - `--loss-type`: Loss type (sigmoid, hinge, ipo)
+- `--reference-free`: Skip reference model for VRAM efficiency
+- `--use-qlora`: Enable QLoRA
 
 ## Data Formats
 
@@ -441,18 +506,61 @@ The `<thinking>...</thinking>` tags contain the model's reasoning process, which
 ]
 ```
 
+## Utilities
+
+### Export Custom Checkpoint to HF Format
+
+Required for QLoRA on custom scaled models:
+
+```bash
+python tools/cli.py export \
+  --input ./checkpoints/4b_scaled \
+  --output ./checkpoints/4b_scaled_hf
+```
+
+### Estimate VRAM Requirements
+
+```bash
+python tools/cli.py estimate \
+  --model-path ./checkpoints/4b_scaled \
+  --use-qlora
+```
+
+### VRAM Estimates by Model Size
+
+| Model | Full BF16 | QLoRA 4-bit |
+|-------|-----------|-------------|
+| 30M   | ~0.2 GB   | ~0.02 GB    |
+| 500M  | ~3 GB     | ~0.5 GB     |
+| 4B    | ~24 GB    | ~2.5 GB     |
+
+*With gradients + optimizer: 4B full = ~70GB, 4B QLoRA = ~3-5GB*
+
 ## Model Output Format
 
-Models are saved in HuggingFace format:
+Models are saved in the following format:
+
+### Custom Checkpoint Format
 
 ```
 ./output/
-├── config.json
-├── model.safetensors
-├── tokenizer.json
-├── tokenizer_config.json
-└── scaling_config.json (for scaled models)
+├── model.pt            # Model weights
+├── config.pt           # Model configuration
+├── tokenizer.json      # Tokenizer
+└── tokenizer_config.json
 ```
+
+### HuggingFace Format (after export)
+
+```
+./output_hf/
+├── config.json
+├── pytorch_model.bin
+├── tokenizer.json
+└── tokenizer_config.json
+```
+
+Scaled models include `scaling_config.json` with original + target architecture details.
 
 ## Development
 
@@ -462,6 +570,17 @@ Models are saved in HuggingFace format:
 # Placeholder for test command
 python -c "from pretrain import DualModeModel; print('Import OK')"
 ```
+
+### Low-VRAM Finetuning
+
+For detailed information on low-VRAM finetuning with QLoRA, see `LOW_VRAM_FINETUNING.md`.
+
+**Quick tips:**
+
+- Use `--use-qlora` for models >1B parameters
+- Set small `batch_size` (1-2) + high `gradient_accumulation_steps`
+- Use YAML configs for easier management
+- Export custom checkpoints to HF format first run (automatic)
 
 ### Code Structure
 
