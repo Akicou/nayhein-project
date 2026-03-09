@@ -26,13 +26,13 @@ if str(ROOT_DIR) not in sys.path:
 
 def cmd_export(args: argparse.Namespace) -> None:
     """Export custom DualModeModel checkpoint to HF format."""
+    from finetune.custom_checkpoint import ensure_hf_export
     from tools.export_hf_format import export_dualmode_to_hf
-    
-    export_dualmode_to_hf(
-        args.input,
-        args.output,
-        model_type=args.model_type,
-    )
+
+    if args.force:
+        ensure_hf_export(args.input, args.output, force=True)
+    else:
+        export_dualmode_to_hf(args.input, args.output, model_type=args.model_type)
     print(f"Export complete: {args.output}")
 
 
@@ -111,6 +111,7 @@ def main() -> None:
     export_parser.add_argument("--input", "-i", type=str, required=True, help="Input checkpoint directory")
     export_parser.add_argument("--output", "-o", type=str, required=True, help="Output HF format directory")
     export_parser.add_argument("--model-type", type=str, default="nayhein_mini", help="Model type identifier")
+    export_parser.add_argument("--force", action="store_true", help="Rebuild the HF export even if it already exists")
     export_parser.set_defaults(func=cmd_export)
     
     # Estimate command

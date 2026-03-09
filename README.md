@@ -264,6 +264,8 @@ python -m finetune.sft \
   --use-gradient-checkpointing
 ```
 
+This path now auto-exports custom checkpoints to a self-contained HF directory with bundled remote code and auto-regenerates stale `hf_format` exports when the source checkpoint changes.
+
 **Standard SFT** (for smaller models with sufficient VRAM):
 
 ```bash
@@ -516,6 +518,12 @@ Required for QLoRA on custom scaled models:
 python tools/cli.py export \
   --input ./checkpoints/4b_scaled \
   --output ./checkpoints/4b_scaled_hf
+
+# Force regeneration of an existing HF export
+python tools/cli.py export \
+  --input ./checkpoints/4b_scaled \
+  --output ./checkpoints/4b_scaled_hf \
+  --force
 ```
 
 ### Estimate VRAM Requirements
@@ -562,13 +570,14 @@ Models are saved in the following format:
 
 Scaled models include `scaling_config.json` with original + target architecture details.
 
+For custom QLoRA exports, the HF directory also bundles `configuration_nayhein_mini.py`, `modeling_nayhein_mini.py`, and `nayhein_export.json`. The HF export contains only the AR/CausalLM path needed for QLoRA; diffusion and MTP heads are intentionally omitted.
+
 ## Development
 
 ### Running Tests
 
 ```bash
-# Placeholder for test command
-python -c "from pretrain import DualModeModel; print('Import OK')"
+python -m unittest tests.test_custom_hf_export
 ```
 
 ### Low-VRAM Finetuning

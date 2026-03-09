@@ -20,7 +20,8 @@ python -m finetune --config config/finetune_4b_qlora.yaml
 ```
 
 This will:
-- Automatically export your custom checkpoint to HF format (first run only)
+- Automatically export your custom checkpoint to a self-contained HF format with bundled remote code
+- Automatically regenerate stale `hf_format` exports when the source checkpoint changes
 - Load the model in 4-bit quantization (~0.5 bytes/param)
 - Apply LoRA adapters to attention + MLP layers
 - Use gradient checkpointing for activation memory savings
@@ -39,6 +40,9 @@ python -m finetune.sft --model-path ./checkpoints/4b_scaled --use-lora --use-qlo
 
 ```bash
 python tools/cli.py export --input ./checkpoints/4b_scaled --output ./checkpoints/4b_scaled_hf
+
+# Force a rebuild if you want to replace an existing export manually
+python tools/cli.py export --input ./checkpoints/4b_scaled --output ./checkpoints/4b_scaled_hf --force
 ```
 
 ### 4. Estimate VRAM requirements
@@ -146,6 +150,8 @@ python tools/cli.py estimate --model-path ./checkpoints/4b_scaled --use-qlora
 ### Custom model loading issues
 - Ensure checkpoint has `model.pt` and `config.pt`
 - Export manually first: `python tools/cli.py export -i ./path -o ./path_hf`
+- The exported HF directory now includes `configuration_nayhein_mini.py` and `modeling_nayhein_mini.py`
+- The HF export only contains the AR/CausalLM path; diffusion and MTP heads are intentionally skipped
 - Then use the HF directory as model path
 
 ## API Usage

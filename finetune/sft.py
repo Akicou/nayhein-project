@@ -49,6 +49,7 @@ except ImportError:
     HAS_BNB = False
 
 from .base import BaseFinetuner, TrainerConfig
+from .custom_checkpoint import ensure_hf_export, is_custom_checkpoint_dir
 from pretrain import DualModeModel, get_default_tokenizer
 
 
@@ -421,8 +422,7 @@ class CustomDualModeAdapterModel(nn.Module):
 class SFTTrainer(BaseFinetuner):
     @staticmethod
     def _is_custom_checkpoint_dir(path: str) -> bool:
-        p = Path(path)
-        return p.is_dir() and (p / "model.pt").exists() and (p / "config.pt").exists()
+        return is_custom_checkpoint_dir(path)
 
     """
     Supervised Fine-Tuning trainer.
@@ -461,12 +461,7 @@ class SFTTrainer(BaseFinetuner):
 
         if self._is_custom_checkpoint_dir(self.config.model_path):
             if self.config.use_qlora:
-                hf_export_dir = Path(self.config.model_path) / "hf_format"
-                if not hf_export_dir.exists():
-                    from tools.export_hf_format import export_dualmode_to_hf
-                    print(f"Exporting custom checkpoint to HF format for QLoRA: {hf_export_dir}")
-                    export_dualmode_to_hf(self.config.model_path, hf_export_dir)
-                model_path_hf = str(hf_export_dir)
+                model_path_hf = str(ensure_hf_export(self.config.model_path))
                 print(f"Loading HF-format model with 4-bit quantization: {model_path_hf}")
                 compute_dtype = torch.bfloat16 if self.config.quantization_compute_dtype == "bfloat16" else torch.float16
                 qconfig = BitsAndBytesConfig(
@@ -475,13 +470,20 @@ class SFTTrainer(BaseFinetuner):
                     bnb_4bit_quant_type="nf4",
                     bnb_4bit_use_double_quant=True,
                 )
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_path_hf,
-                    quantization_config=qconfig,
-                    torch_dtype=compute_dtype,
-                    device_map=self.config.device,
-                    trust_remote_code=True,
-                )
+                try:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_path_hf,
+                        quantization_config=qconfig,
+                        torch_dtype=compute_dtype,
+                        device_map=self.config.device,
+                        trust_remote_code=True,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Failed to load custom HF export at {model_path_hf}. "
+                        f"Expected remote-code files {model_path_hf}/configuration_nayhein_mini.py "
+                        f"and {model_path_hf}/modeling_nayhein_mini.py to define the custom architecture."
+                    ) from exc
                 if self.config.use_gradient_checkpointing:
                     model.gradient_checkpointing_enable()
                 from peft import prepare_model_for_kbit_training
@@ -594,7 +596,13 @@ class SFTTrainer(BaseFinetuner):
     
     def setup_tokenizer(self) -> PreTrainedTokenizer:
         if self._is_custom_checkpoint_dir(self.config.model_path):
-            tokenizer = get_default_tokenizer()
+            if self.config.use_qlora:
+                export_dir = ensure_hf_export(self.config.model_path)
+                tokenizer = AutoTokenizer.from_pretrained(export_dir)
+            else:
+                tokenizer = get_default_tokenizer()
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
             self.tokenizer = tokenizer
             return tokenizer
         return super().setup_tokenizer()
