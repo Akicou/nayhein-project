@@ -18,7 +18,7 @@ if str(ROOT_DIR) not in sys.path:
 from pretrain import DualModeModel, get_default_tokenizer
 
 TEMPLATE_DIR = Path(__file__).resolve().parent / "hf_export_templates"
-EXPORT_VERSION = 1
+EXPORT_VERSION = 2
 EXPORT_METADATA_FILE = "nayhein_export.json"
 REMOTE_CONFIG_FILE = "configuration_nayhein_mini.py"
 REMOTE_MODEL_FILE = "modeling_nayhein_mini.py"

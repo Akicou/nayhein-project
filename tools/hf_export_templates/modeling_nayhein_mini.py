@@ -217,6 +217,7 @@ class NayheinMiniModel(nn.Module):
         return_dict: bool = True,
     ) -> BaseModelOutputWithPast | Tuple[torch.Tensor, ...]:
         batch_size, seq_len = input_ids.shape
+        input_ids = input_ids.clamp(0, self.embed_tokens.num_embeddings - 1)
         past_key_values = past_key_values or tuple([None] * len(self.layers))
         past_len = 0 if not past_key_values or past_key_values[0] is None else past_key_values[0][0].shape[2]
 
@@ -367,6 +368,7 @@ class NayheinMiniForCausalLM(NayheinMiniPreTrainedModel):
     ) -> CausalLMOutputWithPast | Tuple[torch.Tensor, ...]:
         if input_ids is None:
             raise ValueError("input_ids is required")
+        input_ids = input_ids.clamp(0, self.config.vocab_size - 1)
         return_dict = self.config.use_return_dict if return_dict is None else return_dict
         use_cache = self.config.use_cache if use_cache is None else use_cache
 
@@ -385,8 +387,12 @@ class NayheinMiniForCausalLM(NayheinMiniPreTrainedModel):
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
+            vocab_size = shift_logits.size(-1)
+            ignore_mask = shift_labels.eq(-100)
+            shift_labels = shift_labels.clamp(0, vocab_size - 1)
+            shift_labels = shift_labels.masked_fill(ignore_mask, -100)
             loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_logits.view(-1, vocab_size),
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
