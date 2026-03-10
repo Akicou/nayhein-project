@@ -1149,17 +1149,40 @@ def complete_medusa_diffusion(
     return final_ids, medusa_ttft
 
 
+def _looks_like_chatml_prompt(prompt: str) -> bool:
+    stripped = prompt.strip()
+    if not stripped:
+        return False
+    return "<|im_start|>" in stripped or "<|im_end|>" in stripped
+
+
+def _format_prompt(prompt: str, prompt_format: str = "auto") -> str:
+    normalized = (prompt_format or "auto").lower()
+    if normalized not in {"auto", "chatml", "raw"}:
+        raise ValueError(f"Unknown prompt format: {prompt_format}")
+
+    if normalized == "raw":
+        return prompt
+
+    stripped = prompt.strip()
+    if normalized == "auto" and _looks_like_chatml_prompt(stripped):
+        return prompt
+
+    return f"<|im_start|>user\n{stripped}<|im_end|>\n<|im_start|>assistant\n"
+
 def complete(
     prompt: str,
     max_tokens: int = 100,
     temperature: float = 1.0,
     top_p: float = 1.0,
     mode: str = "ar",
+    prompt_format: str = "auto",
     verbose: bool = True,
 ) -> Dict[str, Any]:
     _ensure_loaded()
 
-    input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+    prepared_prompt = _format_prompt(prompt, prompt_format=prompt_format)
+    input_ids = tokenizer(prepared_prompt, return_tensors="pt")["input_ids"].to(device)
     input_length = input_ids.shape[1]
     start_time = time.time()
 
@@ -1223,6 +1246,7 @@ def complete_with_tools(
     temperature: float = 1.0,
     top_p: float = 1.0,
     mode: str = "ar",
+    prompt_format: str = "auto",
     max_tool_cycles: int = 3,
     verbose: bool = True,
 ) -> Dict[str, Any]:
@@ -1233,10 +1257,10 @@ def complete_with_tools(
         init_tools()
 
     tool_schemas = tool_registry.get_schemas_text() if tool_registry else ""
-    full_prompt = prompt
+    full_prompt = _format_prompt(prompt, prompt_format=prompt_format)
     if tool_schemas:
         full_prompt = (
-            f"{prompt}\n\nAvailable tools:\n{tool_schemas}\n\n"
+            f"{full_prompt}\n\nAvailable tools:\n{tool_schemas}\n\n"
             'When you need to use a tool, output the tool call in JSON format: {"tool": "tool_name", "args": {...}}'
         )
 
@@ -1253,6 +1277,7 @@ def complete_with_tools(
             temperature=temperature,
             top_p=top_p,
             mode=mode,
+            prompt_format="raw",
             verbose=verbose,
         )
 
@@ -1330,6 +1355,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, help="Deprecated alias for --model-path when loading model.pt")
     parser.add_argument("--config", type=str, help="Deprecated alias for --config-path")
     parser.add_argument("--prompt", type=str, default="Hello, how are you?", help="Prompt for completion")
+    parser.add_argument("--prompt-format", type=str, default="auto", choices=["auto", "chatml", "raw"], help="Prompt formatting: auto-wrap plain prompts in project ChatML, force ChatML, or send raw text")
     parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens to generate")
     parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     parser.add_argument("--top-p", type=float, default=1.0, help="Nucleus sampling")
@@ -1375,6 +1401,7 @@ def main():
             args.temperature,
             args.top_p,
             args.mode,
+            args.prompt_format,
             args.max_tool_cycles,
             verbose=not args.quiet,
         )
@@ -1395,6 +1422,7 @@ def main():
         args.temperature,
         args.top_p,
         args.mode,
+        args.prompt_format,
         verbose=not args.quiet,
     )
     print("\n=== RESULT ===")
