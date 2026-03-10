@@ -92,10 +92,11 @@ class RotaryPositionEmbedding(nn.Module):
     def __init__(self, dim: int, max_seq_len: int = 2048):
         super().__init__()
         self.dim = dim
+        self.rotary_dim = dim if dim % 2 == 0 else dim - 1
         self.max_seq_len = max_seq_len
         
         # Create inverse frequency table
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.rotary_dim, 2).float() / max(1, self.rotary_dim)))
         self.register_buffer("inv_freq", inv_freq)
         
         # Precompute sin/cos cache
@@ -104,9 +105,13 @@ class RotaryPositionEmbedding(nn.Module):
     def _set_cos_sin_cache(self, seq_len: int):
         """Precompute sin and cos values for efficiency."""
         self.max_seq_len_cached = seq_len
+        if self.rotary_dim == 0:
+            self.register_buffer("cos_cached", torch.empty(seq_len, 0), persistent=False)
+            self.register_buffer("sin_cached", torch.empty(seq_len, 0), persistent=False)
+            return
         t = torch.arange(seq_len, device=self.inv_freq.device)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)  # [seq_len, dim/2]
-        emb = torch.cat([freqs, freqs], dim=-1)  # [seq_len, dim]
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)  # [seq_len, rotary_dim/2]
+        emb = torch.cat([freqs, freqs], dim=-1)  # [seq_len, rotary_dim]
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
     
@@ -119,6 +124,8 @@ class RotaryPositionEmbedding(nn.Module):
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Rotate half of the hidden dims."""
+    if x.shape[-1] == 0:
+        return x
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat([-x2, x1], dim=-1)
@@ -127,11 +134,20 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary position embedding to query and key."""
     # q, k: [batch, heads, seq, dim]
-    cos = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, dim]
-    sin = sin.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, dim]
+    rotary_dim = cos.shape[-1]
+    if rotary_dim == 0:
+        return q, k
+    cos = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, rotary_dim]
+    sin = sin.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, rotary_dim]
     
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    if q_pass.shape[-1] > 0:
+        q_embed = torch.cat([q_embed, q_pass], dim=-1)
+    if k_pass.shape[-1] > 0:
+        k_embed = torch.cat([k_embed, k_pass], dim=-1)
     return q_embed, k_embed
 
 

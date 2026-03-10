@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from pretrain import DualModeModel, get_default_tokenizer
@@ -188,8 +189,12 @@ def _patch_custom_state_dict(model_obj: DualModeModel, state_dict: Dict[str, tor
         model_obj.load_state_dict({key: patched}, strict=False)
 
 
+def _extract_custom_model_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
+    candidate = config.get("target_config", config)
+    return candidate if isinstance(candidate, dict) else config
+
 def _infer_capabilities(model_obj: Any, backend_type: str) -> ModelCapabilities:
-    if backend_type == "custom_native":
+    if backend_type.startswith("custom_native"):
         return ModelCapabilities(
             supports_ar=True,
             supports_diffusion=True,
@@ -383,6 +388,178 @@ def _resolve_adapter_base_path(adapter_dir: Path, base_model_path: Optional[str]
     return recorded
 
 
+def _load_adapter_state_dict(adapter_dir: Path) -> Dict[str, torch.Tensor]:
+    safetensors_path = adapter_dir / "adapter_model.safetensors"
+    if safetensors_path.exists():
+        try:
+            from safetensors.torch import load_file
+        except ImportError as exc:
+            raise ImportError("safetensors is required to load adapter_model.safetensors.") from exc
+        return load_file(str(safetensors_path))
+
+    bin_path = adapter_dir / "adapter_model.bin"
+    if not bin_path.exists():
+        raise FileNotFoundError(
+            f"Adapter weights not found in {adapter_dir}. Expected adapter_model.safetensors or adapter_model.bin."
+        )
+
+    raw_state = torch.load(bin_path, map_location="cpu")
+    if isinstance(raw_state, dict) and "state_dict" in raw_state and isinstance(raw_state["state_dict"], dict):
+        raw_state = raw_state["state_dict"]
+    if not isinstance(raw_state, dict):
+        raise ValueError(f"Unsupported adapter_model.bin format in {adapter_dir}")
+    return raw_state
+
+
+def _strip_peft_module_prefix(module_name: str) -> str:
+    stripped = module_name
+    known_prefixes = ("base_model.model.", "base_model.")
+    changed = True
+    while changed:
+        changed = False
+        for prefix in known_prefixes:
+            if stripped.startswith(prefix):
+                stripped = stripped[len(prefix):]
+                changed = True
+    if stripped.startswith("model."):
+        stripped = stripped[len("model."):]
+    return stripped
+
+
+def _peft_module_to_native_name(module_name: str) -> str:
+    stripped = _strip_peft_module_prefix(module_name)
+    return stripped.replace(".self_attn.", ".attention.")
+
+
+def _resolve_named_submodule(root: nn.Module, module_name: str) -> nn.Module:
+    current: Any = root
+    for part in module_name.split("."):
+        if part.isdigit():
+            current = current[int(part)]
+        else:
+            current = getattr(current, part)
+    return current
+
+
+def _extract_lora_target(key: str) -> tuple[Optional[str], Optional[str]]:
+    suffix_map = {
+        ".lora_A.weight": "A",
+        ".lora_B.weight": "B",
+        ".lora_A.default.weight": "A",
+        ".lora_B.default.weight": "B",
+    }
+    for suffix, part in suffix_map.items():
+        if key.endswith(suffix):
+            return key[: -len(suffix)], part
+    return None, None
+
+
+def _apply_native_lora_adapter(model_obj: DualModeModel, adapter_dir: Path) -> int:
+    adapter_config = json.loads((adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))
+    adapter_state = _load_adapter_state_dict(adapter_dir)
+    default_rank = int(adapter_config.get("r", 1))
+    default_alpha = float(adapter_config.get("lora_alpha", default_rank))
+    rank_pattern = adapter_config.get("rank_pattern") or {}
+    alpha_pattern = adapter_config.get("alpha_pattern") or {}
+    grouped: Dict[str, Dict[str, Any]] = {}
+
+    for key, value in adapter_state.items():
+        module_name, part = _extract_lora_target(key)
+        if module_name is None or part is None:
+            continue
+        bucket = grouped.setdefault(module_name, {})
+        bucket[part] = value
+
+    if not grouped:
+        raise ValueError(f"No LoRA tensors were found in adapter checkpoint {adapter_dir}")
+
+    merged_modules = 0
+    for peft_module_name, tensors in grouped.items():
+        if "A" not in tensors or "B" not in tensors:
+            continue
+
+        native_module_name = _peft_module_to_native_name(peft_module_name)
+        target_module = _resolve_named_submodule(model_obj, native_module_name)
+        if not isinstance(target_module, nn.Linear):
+            raise TypeError(f"LoRA target {native_module_name} is not a linear layer")
+
+        rank = int(rank_pattern.get(peft_module_name, tensors["A"].shape[0] or default_rank))
+        alpha = float(alpha_pattern.get(peft_module_name, default_alpha))
+        scaling = alpha / max(rank, 1)
+        delta = torch.matmul(tensors["B"].to(torch.float32), tensors["A"].to(torch.float32)) * scaling
+
+        if delta.shape != target_module.weight.shape:
+            patched = torch.zeros_like(target_module.weight, dtype=torch.float32)
+            slices = tuple(slice(0, min(dst, src)) for dst, src in zip(target_module.weight.shape, delta.shape))
+            patched[slices] = delta[slices]
+            delta = patched
+
+        target_module.weight.data.add_(delta.to(device=target_module.weight.device, dtype=target_module.weight.dtype))
+        merged_modules += 1
+
+    if merged_modules == 0:
+        raise ValueError(f"Adapter checkpoint {adapter_dir} did not match any native model modules")
+
+    print(f"Merged {merged_modules} LoRA adapter module(s) into native DualModeModel")
+    return merged_modules
+
+
+def _load_custom_native_adapter_dir(
+    adapter_dir: Path,
+    base_model_path: str,
+    tokenizer_path: Optional[str],
+    resolved_device: torch.device,
+    dtype: Optional[torch.dtype],
+    trust_remote_code: bool,
+) -> tuple[Any, Any]:
+    base_checkpoint_dir = Path(base_model_path)
+    resolved_checkpoint = base_checkpoint_dir / "model.pt"
+    resolved_config = base_checkpoint_dir / "config.pt"
+    if not resolved_checkpoint.exists() or not resolved_config.exists():
+        raise FileNotFoundError(
+            f"Custom base checkpoint not found at {base_checkpoint_dir}. Expected model.pt and config.pt."
+        )
+
+    config = torch.load(resolved_config, map_location="cpu")
+    model_cfg = _extract_custom_model_cfg(config)
+    model_obj = DualModeModel(
+        vocab_size=model_cfg.get("original_vocab_size", model_cfg.get("base_vocab_size", model_cfg.get("vocab_size", 16000) - 1)),
+        hidden_size=model_cfg.get("hidden_size", 256),
+        num_layers=model_cfg.get("num_layers", 6),
+        num_heads=model_cfg.get("num_heads", 4),
+        head_dim=model_cfg.get("head_dim", 64),
+        max_seq_len=model_cfg.get("max_seq_len", 8192),
+        use_flash_attn=False,
+        mtp_enabled=model_cfg.get("mtp_enabled", False),
+        mtp_num_heads=model_cfg.get("mtp_num_heads", 3),
+        mtp_loss_weights=model_cfg.get("mtp_loss_weights", [1.0, 0.7, 0.5]),
+    )
+    state_dict = torch.load(resolved_checkpoint, map_location="cpu")
+    _patch_custom_state_dict(model_obj, state_dict)
+    _apply_native_lora_adapter(model_obj, adapter_dir)
+
+    if dtype is not None and resolved_device.type != "cpu":
+        model_obj = model_obj.to(device=resolved_device, dtype=dtype)
+    else:
+        model_obj = model_obj.to(resolved_device)
+    model_obj.eval()
+
+    tokenizer_obj, tokenizer_source = _resolve_hf_tokenizer(
+        adapter_dir,
+        tokenizer_path,
+        trust_remote_code,
+        secondary_path=base_checkpoint_dir,
+    )
+    return _finalize_loaded_model(
+        model_obj,
+        tokenizer_obj,
+        resolved_device,
+        "custom_native_adapter",
+        tokenizer_source,
+        {"model_path": str(adapter_dir), "base_model_path": str(base_checkpoint_dir)},
+    )
+
+
 def _load_adapter_dir(
     adapter_dir: Path,
     base_model_path: Optional[str],
@@ -391,17 +568,22 @@ def _load_adapter_dir(
     dtype: Optional[torch.dtype],
     trust_remote_code: bool,
 ) -> tuple[Any, Any]:
+    resolved_base = _resolve_adapter_base_path(adapter_dir, base_model_path)
+    base_path = Path(resolved_base)
+    if base_path.exists() and _is_custom_checkpoint_dir(base_path):
+        return _load_custom_native_adapter_dir(
+            adapter_dir,
+            resolved_base,
+            tokenizer_path,
+            resolved_device,
+            dtype,
+            trust_remote_code,
+        )
+
     try:
         from peft import PeftModel
     except ImportError as exc:
         raise ImportError("PEFT is required to load adapter checkpoints.") from exc
-
-    resolved_base = _resolve_adapter_base_path(adapter_dir, base_model_path)
-    base_path = Path(resolved_base)
-    if base_path.exists() and _is_custom_checkpoint_dir(base_path):
-        from finetune.custom_checkpoint import ensure_hf_export
-
-        resolved_base = str(ensure_hf_export(base_path))
 
     load_kwargs: Dict[str, Any] = {"trust_remote_code": trust_remote_code}
     if dtype is not None:
@@ -480,7 +662,7 @@ def _warn_mode_fallback(requested_mode: str, fallback_mode: str, verbose: bool) 
 
 
 def _forward_ar_outputs(input_ids: torch.Tensor) -> tuple[torch.Tensor, Any]:
-    if load_context.backend_type == "custom_native":
+    if load_context.backend_type.startswith("custom_native"):
         outputs = model(input_ids, use_cache=False, mode="ar")
         return outputs["ar_logits"], outputs
 
@@ -508,7 +690,7 @@ def _generation_banned_ids() -> List[int]:
     banned_ids = set()
     if hasattr(model, "mask_token_id"):
         banned_ids.add(int(model.mask_token_id))
-    if tokenizer.pad_token_id is not None:
+    if tokenizer.pad_token_id is not None and tokenizer.pad_token_id != tokenizer.eos_token_id:
         banned_ids.add(int(tokenizer.pad_token_id))
     return [token_id for token_id in banned_ids if token_id >= 0]
 
@@ -524,8 +706,48 @@ def _apply_banned_ids(logits: torch.Tensor, banned_ids: List[int]) -> torch.Tens
     return filtered
 
 
+def _safe_softmax(logits: torch.Tensor) -> torch.Tensor:
+    sanitized = logits.to(torch.float32)
+    if torch.isposinf(sanitized).any():
+        posinf_mask = torch.isposinf(sanitized)
+        sanitized = torch.full_like(sanitized, float("-inf"))
+        sanitized[posinf_mask] = 0.0
+    sanitized = torch.nan_to_num(sanitized, nan=float("-inf"), neginf=float("-inf"), posinf=float("-inf"))
+
+    if sanitized.dim() == 1:
+        if not torch.isfinite(sanitized).any():
+            sanitized = torch.zeros_like(sanitized)
+    else:
+        finite_rows = torch.isfinite(sanitized).any(dim=-1, keepdim=True)
+        if not torch.all(finite_rows):
+            sanitized = torch.where(finite_rows, sanitized, torch.zeros_like(sanitized))
+
+    max_logits = sanitized.max(dim=-1, keepdim=True).values
+    shifted = sanitized - max_logits
+    exp_logits = torch.exp(shifted)
+    exp_logits = exp_logits.masked_fill(~torch.isfinite(sanitized), 0.0)
+    denom = exp_logits.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(exp_logits.dtype).tiny)
+    return exp_logits / denom
+
+
 def _apply_top_k_top_p(logits: torch.Tensor, top_p: float = 1.0, top_k: int = 0) -> torch.Tensor:
     filtered = logits.clone()
+    if torch.isposinf(filtered).any():
+        posinf_mask = torch.isposinf(filtered)
+        filtered = torch.full_like(filtered, float("-inf"))
+        filtered[posinf_mask] = 0.0
+    filtered = torch.nan_to_num(filtered, nan=float("-inf"), neginf=float("-inf"), posinf=float("-inf"))
+    base_logits = filtered.clone()
+
+    if filtered.dim() == 1:
+        if not torch.isfinite(filtered).any():
+            filtered = torch.zeros_like(filtered)
+            base_logits = filtered.clone()
+    else:
+        finite_rows = torch.isfinite(filtered).any(dim=-1, keepdim=True)
+        if not torch.all(finite_rows):
+            filtered = torch.where(finite_rows, filtered, torch.zeros_like(filtered))
+            base_logits = filtered.clone()
 
     if top_k > 0 and top_k < filtered.shape[-1]:
         topk_vals, _ = torch.topk(filtered, k=top_k, dim=-1)
@@ -538,7 +760,7 @@ def _apply_top_k_top_p(logits: torch.Tensor, top_p: float = 1.0, top_k: int = 0)
 
     if top_p < 1.0:
         sorted_logits, sorted_indices = torch.sort(filtered, descending=True, dim=-1)
-        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        sorted_probs = _safe_softmax(sorted_logits)
         cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
         sorted_indices_to_remove = cumulative_probs > top_p
         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
@@ -547,11 +769,19 @@ def _apply_top_k_top_p(logits: torch.Tensor, top_p: float = 1.0, top_k: int = 0)
         to_remove.scatter_(-1, sorted_indices, sorted_indices_to_remove)
         filtered = filtered.masked_fill(to_remove, float("-inf"))
 
+        if filtered.dim() == 1:
+            if not torch.isfinite(filtered).any():
+                filtered = base_logits
+        else:
+            finite_rows = torch.isfinite(filtered).any(dim=-1, keepdim=True)
+            if not torch.all(finite_rows):
+                filtered = torch.where(finite_rows, filtered, base_logits)
+
     return filtered
 
 
 def _sample_from_logits(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    probs = torch.softmax(logits, dim=-1)
+    probs = _safe_softmax(logits)
     if probs.dim() == 1:
         sampled = torch.multinomial(probs, num_samples=1)
         confidence = probs.gather(0, sampled)
