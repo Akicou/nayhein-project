@@ -54,6 +54,16 @@ try:
 except ImportError:
     HAS_WANDB = False
 
+# Try to import Accelerate
+try:
+    from accelerate import Accelerator
+    from accelerate.utils import DistributedDataParallelKwargs
+    HAS_ACCELERATE = True
+except ImportError:
+    Accelerator = None
+    DistributedDataParallelKwargs = None
+    HAS_ACCELERATE = False
+
 # Try to import Flash Attention 2
 try:
     from flash_attn import flash_attn_func
@@ -61,6 +71,15 @@ try:
 except ImportError:
     flash_attn_func = None
     HAS_FLASH_ATTN = False
+
+# Import architecture utilities
+try:
+    from utils.architecture import config_from_params, estimate_params
+    HAS_ARCH_UTILS = True
+except ImportError:
+    HAS_ARCH_UTILS = False
+    config_from_params = None
+    estimate_params = None
 
 
 # ============================================================================
@@ -73,10 +92,11 @@ class RotaryPositionEmbedding(nn.Module):
     def __init__(self, dim: int, max_seq_len: int = 2048):
         super().__init__()
         self.dim = dim
+        self.rotary_dim = dim if dim % 2 == 0 else dim - 1
         self.max_seq_len = max_seq_len
         
         # Create inverse frequency table
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.rotary_dim, 2).float() / max(1, self.rotary_dim)))
         self.register_buffer("inv_freq", inv_freq)
         
         # Precompute sin/cos cache
@@ -85,9 +105,13 @@ class RotaryPositionEmbedding(nn.Module):
     def _set_cos_sin_cache(self, seq_len: int):
         """Precompute sin and cos values for efficiency."""
         self.max_seq_len_cached = seq_len
+        if self.rotary_dim == 0:
+            self.register_buffer("cos_cached", torch.empty(seq_len, 0), persistent=False)
+            self.register_buffer("sin_cached", torch.empty(seq_len, 0), persistent=False)
+            return
         t = torch.arange(seq_len, device=self.inv_freq.device)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)  # [seq_len, dim/2]
-        emb = torch.cat([freqs, freqs], dim=-1)  # [seq_len, dim]
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)  # [seq_len, rotary_dim/2]
+        emb = torch.cat([freqs, freqs], dim=-1)  # [seq_len, rotary_dim]
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
     
@@ -100,6 +124,8 @@ class RotaryPositionEmbedding(nn.Module):
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Rotate half of the hidden dims."""
+    if x.shape[-1] == 0:
+        return x
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat([-x2, x1], dim=-1)
@@ -108,11 +134,20 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary position embedding to query and key."""
     # q, k: [batch, heads, seq, dim]
-    cos = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, dim]
-    sin = sin.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, dim]
+    rotary_dim = cos.shape[-1]
+    if rotary_dim == 0:
+        return q, k
+    cos = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, rotary_dim]
+    sin = sin.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, rotary_dim]
     
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    if q_pass.shape[-1] > 0:
+        q_embed = torch.cat([q_embed, q_pass], dim=-1)
+    if k_pass.shape[-1] > 0:
+        k_embed = torch.cat([k_embed, k_pass], dim=-1)
     return q_embed, k_embed
 
 
@@ -298,20 +333,36 @@ class DualModeModel(nn.Module):
         use_cache: bool = False,
         use_flash_attn: bool = False,
         gradient_checkpointing: bool = False,
+        diffusion_mask_prob: float = 0.15,  # Probability of masking tokens for diffusion training
+        mtp_enabled: bool = False,
+        mtp_num_heads: int = 3,
+        mtp_loss_weights: Optional[List[float]] = None,
     ):
         super().__init__()
         self.gradient_checkpointing = gradient_checkpointing
         
-        self.vocab_size = vocab_size
+        # Reserve last token ID for mask token (used in diffusion training)
+        self.vocab_size = vocab_size + 1  # Add 1 for mask token
+        self.original_vocab_size = vocab_size  # Original vocab without mask token
+        self.mask_token_id = vocab_size  # Mask token is at index vocab_size (last before +1)
+        
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.head_dim = head_dim
+        self.mlp_ratio = mlp_ratio
         self.max_seq_len = max_seq_len
         self.use_flash_attn = use_flash_attn and HAS_FLASH_ATTN
+        self.diffusion_mask_prob = diffusion_mask_prob
+        self.mtp_enabled = mtp_enabled
+        self.mtp_num_heads = mtp_num_heads
+        if mtp_loss_weights is None:
+            # Balanced default requested by user
+            mtp_loss_weights = [1.0, 0.7, 0.5]
+        self.mtp_loss_weights = mtp_loss_weights
         
-        # Embeddings
-        self.token_embeddings = nn.Embedding(vocab_size, hidden_size)
+        # Embeddings - use vocab_size + 1 to include mask token
+        self.token_embeddings = nn.Embedding(self.vocab_size, hidden_size)
         # Position embeddings - use smaller base since RoPE handles extrapolation
         # For long context (256K), use 8192 as base and interpolate
         base_pos_len = min(max_seq_len, 8192)
@@ -328,9 +379,13 @@ class DualModeModel(nn.Module):
         # Final layer norm
         self.final_layernorm = nn.LayerNorm(hidden_size, eps=1e-6)
         
-        # Two heads sharing the backbone
-        self.ar_head = ARHead(hidden_size, vocab_size)
-        self.diffusion_head = DiffusionHead(hidden_size, vocab_size)
+        # Heads sharing the backbone (must include diffusion mask token)
+        self.ar_head = ARHead(hidden_size, self.vocab_size)
+        self.diffusion_head = DiffusionHead(hidden_size, self.vocab_size)
+        # Medusa-like MTP heads for AR multi-token prediction
+        self.mtp_heads = nn.ModuleList([
+            ARHead(hidden_size, self.vocab_size) for _ in range(self.mtp_num_heads)
+        ]) if self.mtp_enabled else nn.ModuleList()
         
         # Initialize weights
         self._init_weights()
@@ -366,6 +421,7 @@ class DualModeModel(nn.Module):
         use_cache: bool = False,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         mode: str = "both",
+        is_training: bool = False,
     ) -> dict:
         """
         Forward pass supporting both AR and diffusion modes.
@@ -377,6 +433,7 @@ class DualModeModel(nn.Module):
             use_cache: Whether to use KV caching
             past_key_values: Past KV cache
             mode: "ar", "diffusion", or "both"
+            is_training: Whether in training mode (for diffusion noising)
         
         Returns:
             Dictionary with losses and logits
@@ -386,6 +443,24 @@ class DualModeModel(nn.Module):
         # Clamp input_ids to vocab_size to avoid index out of bounds
         input_ids = input_ids.clamp(0, self.vocab_size - 1)
         
+        # Store original input for diffusion loss computation
+        original_input_ids = input_ids.clone()
+        
+        # For diffusion training: add noise by randomly masking tokens
+        masked_positions = None
+        if mode in ("diffusion", "both") and is_training and labels is not None:
+            # Randomly mask tokens with probability diffusion_mask_prob
+            noise_mask = torch.rand(input_ids.shape, device=input_ids.device) < self.diffusion_mask_prob
+            # Don't mask the last token (need at least some context)
+            noise_mask[:, -1] = False
+            
+            # Replace masked positions with mask token
+            input_ids = input_ids.clone()
+            input_ids[noise_mask] = self.mask_token_id
+            
+            # Store masked positions for loss computation
+            masked_positions = noise_mask
+        
         # Embeddings - always wrap position_ids with modulo to handle any seq_len
         position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
         # Wrap position IDs using modulo (position embeddings are smaller than seq_len)
@@ -393,11 +468,16 @@ class DualModeModel(nn.Module):
         hidden_states = self.token_embeddings(input_ids) + self.position_embeddings(position_ids)
         hidden_states = self.embed_layernorm(hidden_states)
         
-        # Create attention mask for causal attention
-        if attention_mask is None:
-            # Create causal mask
-            attention_mask = torch.full((seq_len, seq_len), float("-inf"), device=input_ids.device)
-            attention_mask = torch.triu(attention_mask, diagonal=1).unsqueeze(0).unsqueeze(0)
+        # Create attention mask based on mode
+        if mode == "diffusion":
+            # Bidirectional attention for diffusion (can see all tokens)
+            attention_mask = None  # No causal masking needed
+        elif mode == "ar" or mode == "both":
+            # Causal attention for AR mode
+            if attention_mask is None:
+                # Create causal mask
+                attention_mask = torch.full((seq_len, seq_len), float("-inf"), device=input_ids.device)
+                attention_mask = torch.triu(attention_mask, diagonal=1).unsqueeze(0).unsqueeze(0)
         
         # Transformer layers
         present = None
@@ -419,17 +499,46 @@ class DualModeModel(nn.Module):
         if mode in ("ar", "both"):
             ar_logits = self.ar_head(hidden_states)
             outputs["ar_logits"] = ar_logits
+
+            # MTP logits are available in both training and inference for Medusa-style decoding
+            mtp_logits = []
+            if self.mtp_enabled and len(self.mtp_heads) > 0:
+                for mtp_head in self.mtp_heads:
+                    mtp_logits.append(mtp_head(hidden_states))
+                outputs["mtp_logits"] = mtp_logits
             
             if labels is not None:
                 # Shift for causal language modeling
                 shift_logits = ar_logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
-                # Clamp labels to vocab_size range
-                shift_labels = shift_labels.clamp(0, self.vocab_size - 1)
+                ar_vocab_size = ar_logits.size(-1)
+                # AR labels should never include the diffusion mask token
+                shift_labels = shift_labels.clamp(0, ar_vocab_size - 1)
                 
                 loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-                ar_loss = loss_fct(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1))
+                ar_loss = loss_fct(shift_logits.view(-1, ar_vocab_size), shift_labels.view(-1))
                 outputs["ar_loss"] = ar_loss
+
+                # MTP loss: head i predicts token at t+(i+1)
+                if self.mtp_enabled and len(mtp_logits) > 0:
+                    mtp_losses = []
+                    for i, h_logits in enumerate(mtp_logits):
+                        horizon = i + 1
+                        if seq_len > horizon:
+                            h_shift_logits = h_logits[..., :-horizon, :].contiguous()
+                            mtp_vocab_size = h_logits.size(-1)
+                            h_shift_labels = labels[..., horizon:].contiguous().clamp(0, mtp_vocab_size - 1)
+                            h_loss = loss_fct(h_shift_logits.view(-1, mtp_vocab_size), h_shift_labels.view(-1))
+                        else:
+                            h_loss = torch.tensor(0.0, device=hidden_states.device)
+                        mtp_losses.append(h_loss)
+
+                    outputs["mtp_losses"] = mtp_losses
+                    mtp_weighted_loss = 0.0
+                    for i, h_loss in enumerate(mtp_losses):
+                        weight = self.mtp_loss_weights[i] if i < len(self.mtp_loss_weights) else 1.0
+                        mtp_weighted_loss = mtp_weighted_loss + (weight * h_loss)
+                    outputs["mtp_loss"] = mtp_weighted_loss
         
         # Diffusion head - for masked token prediction
         if mode in ("diffusion", "both"):
@@ -437,10 +546,27 @@ class DualModeModel(nn.Module):
             outputs["diffusion_logits"] = diffusion_logits
             
             if labels is not None:
-                # Clamp labels to vocab_size range
-                clamped_labels = labels.clamp(0, self.vocab_size - 1)
-                loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-                diffusion_loss = loss_fct(diffusion_logits.view(-1, self.vocab_size), clamped_labels.view(-1))
+                # For diffusion: only compute loss on MASKED positions (denoising objective)
+                # The labels should be the original (unmasked) tokens
+                clamped_labels = original_input_ids.clamp(0, self.original_vocab_size - 1)
+                
+                if masked_positions is not None:
+                    # Only compute loss on masked positions
+                    # Set non-masked positions to ignore_index (-100)
+                    diffusion_vocab_size = diffusion_logits.size(-1)
+                    clamped_labels = clamped_labels.clamp(0, diffusion_vocab_size - 1)
+                    loss_labels = clamped_labels.clone()
+                    loss_labels[~masked_positions] = -100
+                    
+                    loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+                    diffusion_loss = loss_fct(diffusion_logits.view(-1, diffusion_vocab_size), loss_labels.view(-1))
+                else:
+                    # No masking applied (inference or eval mode) - compute loss on all tokens
+                    diffusion_vocab_size = diffusion_logits.size(-1)
+                    clamped_labels = clamped_labels.clamp(0, diffusion_vocab_size - 1)
+                    loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+                    diffusion_loss = loss_fct(diffusion_logits.view(-1, diffusion_vocab_size), clamped_labels.view(-1))
+                
                 outputs["diffusion_loss"] = diffusion_loss
         
         if use_cache:
@@ -489,7 +615,7 @@ class DualModeModel(nn.Module):
         device = input_ids.device
         
         # Start with all tokens masked
-        masked_input = torch.full((batch_size, seq_len), self.vocab_size - 1, dtype=torch.long, device=device)
+        masked_input = torch.full((batch_size, seq_len), self.mask_token_id, dtype=torch.long, device=device)
         
         # Gradually unmask tokens
         num_masked = seq_len
@@ -507,7 +633,7 @@ class DualModeModel(nn.Module):
             # Update masked positions
             for b in range(batch_size):
                 for i in range(seq_len):
-                    if masked_input[b, i] == self.vocab_size - 1:
+                    if masked_input[b, i] == self.mask_token_id:
                         if num_to_unmask > 0:
                             masked_input[b, i] = predictions[b, i]
                             num_to_unmask -= 1
@@ -522,7 +648,7 @@ class DualModeModel(nn.Module):
 class BinaryDataset(Dataset):
     """Dataset for binary token files."""
     
-    def __init__(self, file_path: str, seq_len: int = 512):
+    def __init__(self, file_path: str, seq_len: int = 512, max_samples: Optional[int] = None):
         self.file_path = file_path
         self.seq_len = seq_len
         
@@ -535,6 +661,8 @@ class BinaryDataset(Dataset):
             self.data = np.random.randint(0, 32000, size=(100000,), dtype=np.uint16)
         
         self.num_samples = len(self.data) // seq_len
+        if max_samples is not None:
+            self.num_samples = min(self.num_samples, max_samples)
     
     def __len__(self) -> int:
         return self.num_samples
@@ -549,7 +677,7 @@ class BinaryDataset(Dataset):
 class TextDataset(Dataset):
     """Dataset for text files with on-the-fly tokenization."""
     
-    def __init__(self, file_path: str, tokenizer, seq_len: int = 512):
+    def __init__(self, file_path: str, tokenizer, seq_len: int = 512, max_samples: Optional[int] = None):
         self.file_path = file_path
         self.tokenizer = tokenizer
         self.seq_len = seq_len
@@ -561,6 +689,9 @@ class TextDataset(Dataset):
         else:
             print(f"Warning: {file_path} not found. Using dummy data.")
             self.texts = ["This is a sample text for training." * 10] * 1000
+
+        if max_samples is not None:
+            self.texts = self.texts[:max_samples]
     
     def __len__(self) -> int:
         return len(self.texts)
@@ -636,8 +767,8 @@ class UltraFineWebDataset(Dataset):
     
     def __getitem__(self, idx: int) -> torch.Tensor:
         if self._dummy_mode or idx >= len(self._data):
-            # Return random tokens for dummy mode or out of bounds
-            return torch.randint(0, 32000, (self.seq_len,), dtype=torch.long)
+            # Deterministic fallback to EOS tokens (avoid random garbage targets)
+            return torch.full((self.seq_len,), self.tokenizer.eos_token_id, dtype=torch.long)
         
         try:
             item = self._data[idx]
@@ -645,8 +776,8 @@ class UltraFineWebDataset(Dataset):
             text = item.get("content", item.get("text", ""))
             
             if not text:
-                # Return random tokens for empty text
-                return torch.randint(0, 32000, (self.seq_len,), dtype=torch.long)
+                # Deterministic fallback to EOS tokens for empty text
+                return torch.full((self.seq_len,), self.tokenizer.eos_token_id, dtype=torch.long)
             
             # Tokenize
             tokens = self.tokenizer.encode(
@@ -660,8 +791,8 @@ class UltraFineWebDataset(Dataset):
             return tokens.squeeze(0)
             
         except Exception as e:
-            # Skip problematic items
-            return torch.randint(0, 32000, (self.seq_len,), dtype=torch.long)
+            # Deterministic fallback for problematic items
+            return torch.full((self.seq_len,), self.tokenizer.eos_token_id, dtype=torch.long)
 
 
 def get_default_tokenizer():
@@ -701,6 +832,8 @@ class TrainingConfig:
     log_interval: int = 10
     eval_interval: int = 1000
     max_seq_len: int = 512
+    max_train_steps: Optional[int] = 50000
+    max_samples: Optional[int] = 200000
     
     # Model config
     vocab_size: int = 32000
@@ -720,6 +853,13 @@ class TrainingConfig:
     loss_mode: str = "both"  # "ar", "diffusion", or "both"
     ar_loss_weight: float = 1.0
     diffusion_loss_weight: float = 1.0
+    diffusion_mask_prob: float = 0.15
+    diffusion_mask_prob_start: Optional[float] = None
+    diffusion_mask_prob_end: Optional[float] = None
+    mtp_enabled: bool = True
+    mtp_num_heads: int = 3
+    mtp_loss_weights: List[float] = field(default_factory=lambda: [1.0, 0.7, 0.5])
+    mtp_loss_weight: float = 1.0
     
     # Logging
     wandb_project: Optional[str] = None
@@ -746,23 +886,35 @@ def train_epoch(
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
     config: TrainingConfig,
     epoch: int,
-) -> dict:
+    accelerator=None,
+    start_global_step: int = 0,
+) -> Tuple[dict, int, bool]:
     """Train for one epoch."""
     model.train()
     
     total_loss = 0.0
     total_ar_loss = 0.0
     total_diffusion_loss = 0.0
+    total_mtp_loss = 0.0
     num_batches = 0
     
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    is_main_process = accelerator is None or accelerator.is_main_process
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=not is_main_process)
     optimizer.zero_grad()
+    global_step = start_global_step
+    stop_training = False
     
     for batch_idx, batch in enumerate(pbar):
-        batch = batch.to(config.device)
+        if accelerator is None:
+            batch = batch.to(config.device)
         
         # Forward pass
-        outputs = model(batch, labels=batch, mode=config.loss_mode)
+        # Optional mask-probability curriculum for diffusion training
+        if config.loss_mode in ("diffusion", "both") and config.diffusion_mask_prob_start is not None and config.diffusion_mask_prob_end is not None and config.max_train_steps:
+            progress = min(1.0, global_step / max(1, config.max_train_steps - 1))
+            model.diffusion_mask_prob = config.diffusion_mask_prob_start + (config.diffusion_mask_prob_end - config.diffusion_mask_prob_start) * progress
+
+        outputs = model(batch, labels=batch, mode=config.loss_mode, is_training=True)
         
         # Compute loss
         if config.loss_mode == "both":
@@ -774,28 +926,58 @@ def train_epoch(
             loss = outputs.get("diffusion_loss", 0)
         else:
             loss = outputs.get("ar_loss", 0)
+
+        # Add MTP loss (if enabled and available)
+        if config.mtp_enabled and outputs.get("mtp_loss") is not None:
+            loss = loss + (config.mtp_loss_weight * outputs.get("mtp_loss", 0))
         
         # Scale loss for gradient accumulation
         loss = loss / config.accumulation_steps
         
         # Backward pass
-        loss.backward()
+        if accelerator is not None:
+            accelerator.backward(loss)
+        else:
+            loss.backward()
         
         # Update weights
         if (batch_idx + 1) % config.accumulation_steps == 0:
             if config.use_gradient_checkpointing:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if accelerator is not None:
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
             if scheduler is not None:
                 scheduler.step()
+            global_step += 1
+            if config.max_train_steps is not None and global_step >= config.max_train_steps:
+                stop_training = True
         
         # Logging
-        total_loss += loss.item() * config.accumulation_steps
+        loss_value = loss.item() * config.accumulation_steps
+        ar_loss_value = outputs["ar_loss"].item() if outputs.get("ar_loss") is not None else 0.0
+        diffusion_loss_value = outputs["diffusion_loss"].item() if outputs.get("diffusion_loss") is not None else 0.0
+        mtp_loss_value = outputs["mtp_loss"].item() if outputs.get("mtp_loss") is not None else 0.0
+        
+        if accelerator is not None:
+            loss_tensor = torch.tensor(loss_value, device=outputs["ar_logits"].device if outputs.get("ar_logits") is not None else outputs["diffusion_logits"].device)
+            ar_loss_tensor = torch.tensor(ar_loss_value, device=loss_tensor.device)
+            diffusion_loss_tensor = torch.tensor(diffusion_loss_value, device=loss_tensor.device)
+            mtp_loss_tensor = torch.tensor(mtp_loss_value, device=loss_tensor.device)
+            loss_value = accelerator.gather_for_metrics(loss_tensor).mean().item()
+            ar_loss_value = accelerator.gather_for_metrics(ar_loss_tensor).mean().item()
+            diffusion_loss_value = accelerator.gather_for_metrics(diffusion_loss_tensor).mean().item()
+            mtp_loss_value = accelerator.gather_for_metrics(mtp_loss_tensor).mean().item()
+        
+        total_loss += loss_value
         if outputs.get("ar_loss") is not None:
-            total_ar_loss += outputs["ar_loss"].item()
+            total_ar_loss += ar_loss_value
         if outputs.get("diffusion_loss") is not None:
-            total_diffusion_loss += outputs["diffusion_loss"].item()
+            total_diffusion_loss += diffusion_loss_value
+        if outputs.get("mtp_loss") is not None:
+            total_mtp_loss += mtp_loss_value
         num_batches += 1
         
         pbar.set_postfix({
@@ -805,66 +987,95 @@ def train_epoch(
         
         # Log to wandb
         if config.wandb_project and HAS_WANDB and batch_idx % config.log_interval == 0:
-            wandb.log({
-                "train/loss": total_loss / num_batches,
-                "train/ar_loss": total_ar_loss / max(1, num_batches),
-                "train/diffusion_loss": total_diffusion_loss / max(1, num_batches),
-                "train/lr": optimizer.param_groups[0]["lr"],
-                "train/step": epoch * len(dataloader) + batch_idx,
-            })
+            if accelerator is None or accelerator.is_main_process:
+                wandb.log({
+                    "train/loss": total_loss / num_batches,
+                    "train/ar_loss": total_ar_loss / max(1, num_batches),
+                    "train/diffusion_loss": total_diffusion_loss / max(1, num_batches),
+                    "train/mtp_loss": total_mtp_loss / max(1, num_batches),
+                    "train/lr": optimizer.param_groups[0]["lr"],
+                    "train/step": global_step,
+                })
+
+        if stop_training:
+            break
     
+    denom = max(1, num_batches)
     return {
-        "loss": total_loss / num_batches,
-        "ar_loss": total_ar_loss / num_batches if total_ar_loss > 0 else None,
-        "diffusion_loss": total_diffusion_loss / num_batches if total_diffusion_loss > 0 else None,
-    }
+        "loss": total_loss / denom,
+        "ar_loss": total_ar_loss / denom if total_ar_loss > 0 else None,
+        "diffusion_loss": total_diffusion_loss / denom if total_diffusion_loss > 0 else None,
+        "mtp_loss": total_mtp_loss / denom if total_mtp_loss > 0 else None,
+    }, global_step, stop_training
 
 
-def evaluate(model: nn.Module, dataloader: DataLoader, config: TrainingConfig) -> dict:
+def evaluate(model: nn.Module, dataloader: DataLoader, config: TrainingConfig, accelerator=None) -> dict:
     """Evaluate the model."""
     model.eval()
     
     total_loss = 0.0
     num_batches = 0
+    is_main_process = accelerator is None or accelerator.is_main_process
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            batch = batch.to(config.device)
-            outputs = model(batch, labels=batch, mode=config.loss_mode)
+        for batch in tqdm(dataloader, desc="Evaluating", disable=not is_main_process):
+            if accelerator is None:
+                batch = batch.to(config.device)
+            outputs = model(batch, labels=batch, mode=config.loss_mode, is_training=False)
             
             if config.loss_mode == "both":
                 loss = config.ar_loss_weight * outputs.get("ar_loss", 0) + \
                        config.diffusion_loss_weight * outputs.get("diffusion_loss", 0)
             elif config.loss_mode == "ar":
                 loss = outputs.get("ar_loss", 0)
+            elif config.loss_mode == "diffusion":
+                loss = outputs.get("diffusion_loss", 0)
             else:
                 loss = outputs.get("ar_loss", 0)
+
+            if config.mtp_enabled and outputs.get("mtp_loss") is not None:
+                loss = loss + (config.mtp_loss_weight * outputs.get("mtp_loss", 0))
             
-            total_loss += loss.item()
+            loss_value = loss.item()
+            if accelerator is not None:
+                loss_tensor = torch.tensor(loss_value, device=outputs["ar_logits"].device if outputs.get("ar_logits") is not None else outputs["diffusion_logits"].device)
+                loss_value = accelerator.gather_for_metrics(loss_tensor).mean().item()
+            total_loss += loss_value
             num_batches += 1
     
-    return {"loss": total_loss / num_batches}
+    return {"loss": total_loss / max(1, num_batches)}
 
 
-def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, scheduler, epoch: int, step: int, config: TrainingConfig):
+def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, scheduler, epoch: int, step: int, config: TrainingConfig, accelerator=None):
     """Save model checkpoint."""
     os.makedirs(config.output_dir, exist_ok=True)
+    
+    if accelerator is not None and not accelerator.is_main_process:
+        return
     
     # Save model checkpoint
     save_path = Path(config.output_dir) / f"checkpoint-epoch{epoch}-step{step}"
     save_path.mkdir(exist_ok=True)
     
+    unwrapped_model = accelerator.unwrap_model(model) if accelerator is not None else model
+    
     # Save model state dict (plain PyTorch)
-    torch.save(model.state_dict(), save_path / "model.pt")
+    torch.save(unwrapped_model.state_dict(), save_path / "model.pt")
     
     # Save model config
     config_dict = {
-        "vocab_size": model.vocab_size,
-        "hidden_size": model.hidden_size,
-        "num_layers": model.num_layers,
-        "num_heads": model.num_heads,
-        "head_dim": model.head_dim,
-        "max_seq_len": model.max_seq_len,
+        "vocab_size": unwrapped_model.vocab_size,
+        "original_vocab_size": unwrapped_model.original_vocab_size,
+        "mask_token_id": unwrapped_model.mask_token_id,
+        "hidden_size": unwrapped_model.hidden_size,
+        "num_layers": unwrapped_model.num_layers,
+        "num_heads": unwrapped_model.num_heads,
+        "head_dim": unwrapped_model.head_dim,
+        "max_seq_len": unwrapped_model.max_seq_len,
+        "mlp_ratio": getattr(unwrapped_model, "mlp_ratio", 4.0),
+        "mtp_enabled": getattr(unwrapped_model, "mtp_enabled", False),
+        "mtp_num_heads": getattr(unwrapped_model, "mtp_num_heads", 0),
+        "mtp_loss_weights": getattr(unwrapped_model, "mtp_loss_weights", [1.0, 0.7, 0.5]),
     }
     torch.save(config_dict, save_path / "config.pt")
     
@@ -876,7 +1087,8 @@ def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, schedule
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
     }, save_path / "trainer_state.pt")
     
-    print(f"Saved checkpoint to {save_path}")
+    if accelerator is None or accelerator.is_main_process:
+        print(f"Saved checkpoint to {save_path}")
 
 
 # ============================================================================
@@ -893,6 +1105,8 @@ def main():
     
     # Training arguments
     parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
+    parser.add_argument("--max-train-steps", type=int, default=50000, help="Hard cap on optimizer update steps")
+    parser.add_argument("--max-samples", type=int, default=200000, help="Maximum number of dataset samples to load/use")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size (smaller for long sequences)")
     parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
@@ -903,6 +1117,8 @@ def main():
     parser.add_argument("--seq-len", type=int, default=512, help="Sequence length")
     
     # Model arguments - defaults for ~10M model
+    parser.add_argument("--target-parameters", type=int, default=None, help="Target parameter count (auto-calculates architecture)")
+    parser.add_argument("--base-profile", type=str, default="small", choices=["tiny", "small", "medium", "large", "xl"], help="Base profile for auto-calculation (used with --target-parameters)")
     parser.add_argument("--vocab-size", type=int, default=16000, help="Vocabulary size")
     parser.add_argument("--hidden-size", type=int, default=256, help="Hidden size")
     parser.add_argument("--num-layers", type=int, default=6, help="Number of layers")
@@ -917,11 +1133,66 @@ def main():
     parser.add_argument("--loss-mode", type=str, default="both", choices=["ar", "diffusion", "both"], help="Loss mode")
     parser.add_argument("--ar-loss-weight", type=float, default=1.0, help="AR loss weight")
     parser.add_argument("--diffusion-loss-weight", type=float, default=1.0, help="Diffusion loss weight")
+    parser.add_argument("--diffusion-mask-prob", type=float, default=0.15, help="Static diffusion masking probability")
+    parser.add_argument("--diffusion-mask-prob-start", type=float, default=None, help="Optional curriculum start mask probability")
+    parser.add_argument("--diffusion-mask-prob-end", type=float, default=None, help="Optional curriculum end mask probability")
+    parser.add_argument("--mtp-enabled", action="store_true", default=True, help="Enable Medusa-style MTP heads for AR training (default: enabled)")
+    parser.add_argument("--no-mtp", action="store_true", help="Disable Medusa-style MTP heads")
+    parser.add_argument("--mtp-num-heads", type=int, default=3, help="Number of MTP heads")
+    parser.add_argument("--mtp-loss-weight", type=float, default=1.0, help="Global weight for combined MTP loss")
+    parser.add_argument("--mtp-loss-weights", type=str, default="1.0,0.7,0.5", help="Comma-separated per-head MTP loss weights")
     
     # Logging
     parser.add_argument("--wandb-project", type=str, default=None, help="WandB project name")
+    parser.add_argument("--use-accelerate", action="store_true", help="Enable accelerate-based multi-GPU training")
     
     args = parser.parse_args()
+    
+    # Auto-calculate architecture from target parameters if provided
+    if args.target_parameters is not None:
+        if not HAS_ARCH_UTILS:
+            raise ImportError("Architecture utilities not available. Ensure utils/architecture.py exists.")
+        
+        # Check if manual architecture args are also provided
+        manual_args = [args.hidden_size, args.num_layers, args.num_heads, args.head_dim, args.mlp_ratio]
+        if all(arg is not None and arg != parser.get_default("hidden_size") for arg in manual_args):
+            print("WARNING: --target-parameters specified. Manual architecture arguments will be overridden.")
+            print(f"  Ignoring: --hidden-size={args.hidden_size}, --num-layers={args.num_layers}, --num-heads={args.num_heads}")
+            print()
+        
+        print(f"\n=== Auto-calculating architecture for {args.target_parameters:,} parameters ===")
+        print(f"Base profile: {args.base_profile}")
+        
+        auto_config = config_from_params(
+            target_params=args.target_parameters,
+            base_profile=args.base_profile,
+            vocab_size=args.vocab_size,
+            max_seq_len=args.seq_len,
+            mtp_enabled=args.mtp_enabled and (not args.no_mtp),
+            mtp_num_heads=args.mtp_num_heads,
+        )
+        
+        estimated_params = estimate_params(auto_config)
+        print(f"Calculated configuration:")
+        print(f"  Hidden size: {auto_config['hidden_size']}")
+        print(f"  Num layers: {auto_config['num_layers']}")
+        print(f"  Num heads: {auto_config['num_heads']}")
+        print(f"  Head dim: {auto_config['head_dim']}")
+        print(f"  Estimated params: {estimated_params:,}")
+        print(f"  Target params: {args.target_parameters:,}")
+        print(f"  Error: {abs(estimated_params - args.target_parameters):,} ({abs(estimated_params - args.target_parameters) / args.target_parameters * 100:.2f}%)")
+        print()
+        
+        # Override manual arguments with auto-calculated values
+        args.hidden_size = auto_config['hidden_size']
+        args.num_layers = auto_config['num_layers']
+        args.num_heads = auto_config['num_heads']
+        args.head_dim = auto_config['head_dim']
+        args.mlp_ratio = auto_config.get('mlp_ratio', args.mlp_ratio)
+    
+    # Parse MTP loss weights
+    mtp_loss_weights = [float(x.strip()) for x in args.mtp_loss_weights.split(",") if x.strip()]
+    mtp_enabled = args.mtp_enabled and (not args.no_mtp)
     
     # Create config
     config = TrainingConfig(
@@ -936,6 +1207,8 @@ def main():
         log_interval=args.log_interval,
         eval_interval=args.eval_interval,
         max_seq_len=args.seq_len,
+        max_train_steps=args.max_train_steps,
+        max_samples=args.max_samples,
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
@@ -949,15 +1222,36 @@ def main():
         loss_mode=args.loss_mode,
         ar_loss_weight=args.ar_loss_weight,
         diffusion_loss_weight=args.diffusion_loss_weight,
+        diffusion_mask_prob=args.diffusion_mask_prob,
+        diffusion_mask_prob_start=args.diffusion_mask_prob_start,
+        diffusion_mask_prob_end=args.diffusion_mask_prob_end,
+        mtp_enabled=mtp_enabled,
+        mtp_num_heads=args.mtp_num_heads,
+        mtp_loss_weights=mtp_loss_weights,
+        mtp_loss_weight=args.mtp_loss_weight,
         wandb_project=args.wandb_project,
     )
     
-    # Initialize wandb
-    if config.wandb_project and HAS_WANDB:
-        wandb.init(project=config.wandb_project, config=vars(config))
+    # Setup accelerator (optional multi-GPU)
+    accelerator = None
+    if args.use_accelerate:
+        if not HAS_ACCELERATE:
+            raise ImportError("accelerate is not installed. Install it via: pip install accelerate")
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        accelerator = Accelerator(
+            mixed_precision=config.mixed_precision if config.mixed_precision != "fp32" else "no",
+            kwargs_handlers=[ddp_kwargs],
+        )
+        device = accelerator.device
+        config.device = str(device)
+    else:
+        device = torch.device(config.device)
     
-    # Set device
-    device = torch.device(config.device)
+    # Initialize wandb (main process only)
+    if config.wandb_project and HAS_WANDB:
+        if accelerator is None or accelerator.is_main_process:
+            wandb.init(project=config.wandb_project, config=vars(config))
+    
     print(f"Using device: {device}")
     
     # Create model
@@ -968,7 +1262,9 @@ def main():
     print(f"Num heads: {config.num_heads}")
     print(f"Head dim: {config.head_dim}")
     print(f"Flash Attention: {config.use_flash_attention}")
+    print(f"MTP Enabled: {config.mtp_enabled} (heads={config.mtp_num_heads}, weights={config.mtp_loss_weights})")
     
+    tokenizer = None
     model = DualModeModel(
         vocab_size=config.vocab_size,
         hidden_size=config.hidden_size,
@@ -979,26 +1275,16 @@ def main():
         max_seq_len=config.max_seq_len,
         use_flash_attn=config.use_flash_attention,
         gradient_checkpointing=config.use_gradient_checkpointing,
+        diffusion_mask_prob=config.diffusion_mask_prob,
+        mtp_enabled=config.mtp_enabled,
+        mtp_num_heads=config.mtp_num_heads,
+        mtp_loss_weights=config.mtp_loss_weights,
     )
     
     num_params = model.get_num_params()
     print(f"\nTotal parameters: {num_params:,} ({num_params / 1e6:.1f}M)")
     
     model = model.to(device)
-    
-    # Resize token embeddings if tokenizer has more tokens (due to special tokens)
-    if hasattr(tokenizer, 'vocab_size') and tokenizer.vocab_size > model.vocab_size:
-        print(f"Resizing token embeddings from {model.vocab_size} to {len(tokenizer)}")
-        model.vocab_size = len(tokenizer)
-        old_embeddings = model.token_embeddings
-        model.token_embeddings = nn.Embedding(len(tokenizer), model.hidden_size).to(device)
-        # Copy old embeddings
-        with torch.no_grad():
-            model.token_embeddings.weight[:old_embeddings.num_embeddings] = old_embeddings.weight
-        # Initialize new embeddings
-        torch.nn.init.normal_(model.token_embeddings.weight[old_embeddings.num_embeddings:], mean=0.0, std=0.02)
-        num_params = model.get_num_params()
-        print(f"Updated parameters: {num_params:,} ({num_params / 1e6:.1f}M)")
     
     # Enable gradient checkpointing
     if config.use_gradient_checkpointing:
@@ -1017,14 +1303,72 @@ def main():
             split="en",  # Ultra-FineWeb uses 'en' or 'zh' splits
             seq_len=config.max_seq_len,
             tokenizer=tokenizer,
+            max_samples=config.max_samples,
         )
     elif config.data_path.endswith(".txt"):
         # Text file
         tokenizer = get_default_tokenizer()
-        train_dataset = TextDataset(config.data_path, tokenizer, config.max_seq_len)
+        train_dataset = TextDataset(config.data_path, tokenizer, config.max_seq_len, max_samples=config.max_samples)
     else:
         # Binary token file
-        train_dataset = BinaryDataset(config.data_path, config.max_seq_len)
+        train_dataset = BinaryDataset(config.data_path, config.max_seq_len, max_samples=config.max_samples)
+
+    # If tokenizer-based training is used, align model vocab to tokenizer length BEFORE training
+    if tokenizer is not None:
+        tokenizer_size = len(tokenizer)
+        # Model reserves one extra token for diffusion mask => expected vocab is tokenizer_size + 1
+        target_model_vocab = tokenizer_size + 1
+        if target_model_vocab != model.vocab_size:
+            print(f"Aligning model vocab to tokenizer: model={model.vocab_size}, tokenizer+mask={target_model_vocab}")
+
+            # Resize token embeddings
+            old_embeddings = model.token_embeddings
+            new_embeddings = nn.Embedding(target_model_vocab, model.hidden_size).to(device)
+            copy_n = min(old_embeddings.num_embeddings, target_model_vocab)
+            with torch.no_grad():
+                new_embeddings.weight[:copy_n] = old_embeddings.weight[:copy_n]
+                if target_model_vocab > copy_n:
+                    torch.nn.init.normal_(new_embeddings.weight[copy_n:], mean=0.0, std=0.02)
+            model.token_embeddings = new_embeddings
+
+            # Resize AR head
+            old_ar_head = model.ar_head.lm_head
+            new_ar_head = nn.Linear(model.hidden_size, target_model_vocab, bias=False).to(device)
+            ar_copy_n = min(old_ar_head.out_features, target_model_vocab)
+            with torch.no_grad():
+                new_ar_head.weight[:ar_copy_n] = old_ar_head.weight[:ar_copy_n]
+                if target_model_vocab > ar_copy_n:
+                    torch.nn.init.normal_(new_ar_head.weight[ar_copy_n:], mean=0.0, std=0.02)
+            model.ar_head.lm_head = new_ar_head
+
+            # Resize diffusion decoder
+            old_diff_decoder = model.diffusion_head.decoder
+            new_diff_decoder = nn.Linear(model.hidden_size, target_model_vocab, bias=False).to(device)
+            diff_copy_n = min(old_diff_decoder.out_features, target_model_vocab)
+            with torch.no_grad():
+                new_diff_decoder.weight[:diff_copy_n] = old_diff_decoder.weight[:diff_copy_n]
+                if target_model_vocab > diff_copy_n:
+                    torch.nn.init.normal_(new_diff_decoder.weight[diff_copy_n:], mean=0.0, std=0.02)
+            model.diffusion_head.decoder = new_diff_decoder
+
+            # Resize MTP heads if enabled
+            if getattr(model, "mtp_enabled", False) and len(getattr(model, "mtp_heads", [])) > 0:
+                for i, mtp_head in enumerate(model.mtp_heads):
+                    old_mtp = mtp_head.lm_head
+                    new_mtp = nn.Linear(model.hidden_size, target_model_vocab, bias=False).to(device)
+                    mtp_copy_n = min(old_mtp.out_features, target_model_vocab)
+                    with torch.no_grad():
+                        new_mtp.weight[:mtp_copy_n] = old_mtp.weight[:mtp_copy_n]
+                        if target_model_vocab > mtp_copy_n:
+                            torch.nn.init.normal_(new_mtp.weight[mtp_copy_n:], mean=0.0, std=0.02)
+                    model.mtp_heads[i].lm_head = new_mtp
+
+            model.vocab_size = target_model_vocab
+            # Keep mask token as last token id in aligned vocab
+            model.mask_token_id = target_model_vocab - 1
+            model.original_vocab_size = tokenizer_size
+            num_params = model.get_num_params()
+            print(f"Updated parameters after vocab alignment: {num_params:,} ({num_params / 1e6:.1f}M)")
     
     train_loader = DataLoader(
         train_dataset, 
@@ -1043,12 +1387,13 @@ def main():
                 split="zh",
                 seq_len=config.max_seq_len,
                 tokenizer=tokenizer,
+                max_samples=config.max_samples,
             )
         elif config.val_data_path.endswith(".txt"):
             tokenizer = get_default_tokenizer()
-            val_dataset = TextDataset(config.val_data_path, tokenizer, config.max_seq_len)
+            val_dataset = TextDataset(config.val_data_path, tokenizer, config.max_seq_len, max_samples=config.max_samples)
         else:
-            val_dataset = BinaryDataset(config.val_data_path, config.max_seq_len)
+            val_dataset = BinaryDataset(config.val_data_path, config.max_seq_len, max_samples=config.max_samples)
         
         val_loader = DataLoader(
             val_dataset, 
@@ -1061,42 +1406,84 @@ def main():
     # Create optimizer
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
     
+    # Prepare for multi-GPU training (if enabled)
+    if accelerator is not None:
+        if val_loader is not None:
+            model, optimizer, train_loader, val_loader = accelerator.prepare(model, optimizer, train_loader, val_loader)
+        else:
+            model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    
     # Create scheduler
-    num_training_steps = len(train_loader) * config.epochs // config.accumulation_steps
+    estimated_steps = len(train_loader) * config.epochs // config.accumulation_steps
+    num_training_steps = config.max_train_steps if config.max_train_steps is not None else estimated_steps
     scheduler = get_linear_schedule_with_warmup(optimizer, config.warmup_steps, num_training_steps)
     
     # Training loop
-    print("\n=== Starting Training ===")
+    if accelerator is None or accelerator.is_main_process:
+        print("\n=== Starting Training ===")
     global_step = 0
     
     for epoch in range(config.epochs):
-        train_metrics = train_epoch(model, train_loader, optimizer, scheduler, config, epoch)
-        print(f"Epoch {epoch}: {train_metrics}")
+        train_metrics, global_step, stop_training = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            scheduler,
+            config,
+            epoch,
+            accelerator=accelerator,
+            start_global_step=global_step,
+        )
+        if accelerator is None or accelerator.is_main_process:
+            print(f"Epoch {epoch}: {train_metrics}")
         
         # Save checkpoint
-        save_checkpoint(model, optimizer, scheduler, epoch, global_step, config)
+        save_checkpoint(model, optimizer, scheduler, epoch, global_step, config, accelerator=accelerator)
         
         # Evaluate
         if val_loader is not None and (epoch + 1) % config.eval_interval == 0:
-            eval_metrics = evaluate(model, val_loader, config)
-            print(f"Evaluation: {eval_metrics}")
-            
-            if config.wandb_project and HAS_WANDB:
-                wandb.log({"eval/loss": eval_metrics["loss"]})
-        
-        global_step += len(train_loader)
+            eval_metrics = evaluate(model, val_loader, config, accelerator=accelerator)
+            if accelerator is None or accelerator.is_main_process:
+                print(f"Evaluation: {eval_metrics}")
+                
+                if config.wandb_project and HAS_WANDB:
+                    wandb.log({"eval/loss": eval_metrics["loss"]})
+
+        if stop_training:
+            if accelerator is None or accelerator.is_main_process:
+                print(f"Reached max_train_steps={config.max_train_steps}, stopping training.")
+            break
     
     # Final save
-    save_path = Path(config.output_dir) / "final"
-    save_path.mkdir(exist_ok=True)
-    model.save_pretrained(save_path)
-    print(f"\nFinal model saved to {save_path}")
-    
-    # Log model size
-    print(f"\n=== Final Model Statistics ===")
-    print(f"Total parameters: {model.get_num_params():,}")
-    print(f"AR head parameters: {sum(p.numel() for p in model.ar_head.parameters()):,}")
-    print(f"Diffusion head parameters: {sum(p.numel() for p in model.diffusion_head.parameters()):,}")
+    if accelerator is None or accelerator.is_main_process:
+        save_path = Path(config.output_dir) / "final"
+        save_path.mkdir(exist_ok=True)
+        model_to_save = accelerator.unwrap_model(model) if accelerator is not None else model
+        if hasattr(model_to_save, "save_pretrained"):
+            model_to_save.save_pretrained(save_path)
+        else:
+            torch.save(model_to_save.state_dict(), save_path / "model.pt")
+            torch.save({
+                "vocab_size": model_to_save.vocab_size,
+                "original_vocab_size": model_to_save.original_vocab_size,
+                "mask_token_id": model_to_save.mask_token_id,
+                "hidden_size": model_to_save.hidden_size,
+                "num_layers": model_to_save.num_layers,
+                "num_heads": model_to_save.num_heads,
+                "head_dim": model_to_save.head_dim,
+                "max_seq_len": model_to_save.max_seq_len,
+                "mlp_ratio": getattr(model_to_save, "mlp_ratio", 4.0),
+                "mtp_enabled": getattr(model_to_save, "mtp_enabled", False),
+                "mtp_num_heads": getattr(model_to_save, "mtp_num_heads", 0),
+                "mtp_loss_weights": getattr(model_to_save, "mtp_loss_weights", [1.0, 0.7, 0.5]),
+            }, save_path / "config.pt")
+        print(f"\nFinal model saved to {save_path}")
+        
+        # Log model size
+        print(f"\n=== Final Model Statistics ===")
+        print(f"Total parameters: {model_to_save.get_num_params():,}")
+        print(f"AR head parameters: {sum(p.numel() for p in model_to_save.ar_head.parameters()):,}")
+        print(f"Diffusion head parameters: {sum(p.numel() for p in model_to_save.diffusion_head.parameters()):,}")
 
 
 if __name__ == "__main__":

@@ -25,10 +25,13 @@ from transformers import (
     AutoTokenizer,
     PreTrainedModel,
     PreTrainedTokenizer,
+    BitsAndBytesConfig,
 )
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
 from .base import BaseFinetuner, TrainerConfig
+from .custom_checkpoint import clear_hf_module_cache, ensure_hf_export, is_custom_checkpoint_dir
+from pretrain import get_default_tokenizer
 
 
 @dataclass
@@ -158,36 +161,76 @@ class DPOTrainer(BaseFinetuner):
         super().__init__(config)
         self.config: DPOConfig = config
         self.reference_model: Optional[PreTrainedModel] = None
+
+    def _resolve_hf_model_path(self, model_path: str) -> str:
+        if self.config.use_qlora and is_custom_checkpoint_dir(model_path):
+            export_dir = ensure_hf_export(model_path)
+            clear_hf_module_cache(export_dir)
+            return str(export_dir)
+        return model_path
     
     def setup_model(self) -> PreTrainedModel:
         """Setup model for DPO."""
         print(f"Loading model from {self.config.model_path}")
-        
-        # Load policy model
-        model = AutoModelForCausalLM.from_pretrained(
-            self.config.model_path,
-            torch_dtype=torch.bfloat16 if self.config.mixed_precision == "bf16" else torch.float32,
-            device_map=self.config.device,
-            trust_remote_code=True,
-        )
-        
-        # Freeze model for reference if reference-free
-        if self.config.reference_free:
-            for param in model.parameters():
-                param.requires_grad = False
+        resolved_model_path = self._resolve_hf_model_path(self.config.model_path)
+
+        if self.config.use_qlora:
+            compute_dtype = torch.bfloat16 if self.config.quantization_compute_dtype == "bfloat16" else torch.float16
+            qconfig = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            )
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    resolved_model_path,
+                    quantization_config=qconfig,
+                    torch_dtype=compute_dtype,
+                    device_map=self.config.device,
+                    trust_remote_code=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to load model for DPO from {resolved_model_path}. "
+                    "If this is a custom checkpoint, verify the HF export contains the bundled remote-code files."
+                ) from exc
+        else:
+            # Load policy model
+            model = AutoModelForCausalLM.from_pretrained(
+                resolved_model_path,
+                torch_dtype=torch.bfloat16 if self.config.mixed_precision == "bf16" else torch.float32,
+                device_map=self.config.device,
+                trust_remote_code=True,
+            )
         
         # Gradient checkpointing
         if self.config.use_gradient_checkpointing:
             model.gradient_checkpointing_enable()
         
         return model
+
+    def setup_tokenizer(self) -> PreTrainedTokenizer:
+        if is_custom_checkpoint_dir(self.config.model_path):
+            if self.config.use_qlora:
+                export_dir = ensure_hf_export(self.config.model_path)
+                clear_hf_module_cache(export_dir)
+                tokenizer = AutoTokenizer.from_pretrained(export_dir, trust_remote_code=True)
+            else:
+                tokenizer = get_default_tokenizer()
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            self.tokenizer = tokenizer
+            return tokenizer
+        return super().setup_tokenizer()
     
     def setup_reference_model(self) -> PreTrainedModel:
         """Setup reference model for DPO."""
         if self.config.reference_model_path:
             print(f"Loading reference model from {self.config.reference_model_path}")
+            reference_model_path = self._resolve_hf_model_path(self.config.reference_model_path)
             ref_model = AutoModelForCausalLM.from_pretrained(
-                self.config.reference_model_path,
+                reference_model_path,
                 torch_dtype=torch.bfloat16 if self.config.mixed_precision == "bf16" else torch.float32,
                 device_map=self.config.device,
                 trust_remote_code=True,
@@ -195,8 +238,9 @@ class DPOTrainer(BaseFinetuner):
         else:
             # Clone from policy model
             print("Cloning policy model as reference")
+            reference_model_path = self._resolve_hf_model_path(self.config.model_path)
             ref_model = AutoModelForCausalLM.from_pretrained(
-                self.config.model_path,
+                reference_model_path,
                 torch_dtype=torch.bfloat16 if self.config.mixed_precision == "bf16" else torch.float32,
                 device_map=self.config.device,
                 trust_remote_code=True,
@@ -449,6 +493,9 @@ def main():
         lora_dropout=args.lora_dropout,
         lora_target_modules=args.lora_target_modules,
         use_qlora=args.use_qlora,
+        quantization_bits=args.quantization_bits,
+        quantization_compute_dtype=args.quantization_compute_dtype,
+        save_mode=args.save_mode,
         use_gradient_checkpointing=args.use_gradient_checkpointing,
         mixed_precision=args.mixed_precision,
         log_interval=args.log_interval,

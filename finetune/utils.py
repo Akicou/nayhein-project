@@ -4,7 +4,8 @@ Shared utilities for finetuning.
 """
 
 import os
-from typing import Dict, List, Optional, Any
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Tuple
 
 import torch
 import torch.nn as nn
@@ -15,8 +16,9 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizer,
     DataCollator,
+    BitsAndBytesConfig,
 )
-from peft import LoraConfig, get_peft_model, TaskType, PeftModel
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel, prepare_model_for_kbit_training
 
 
 def setup_tokenizer(
@@ -64,40 +66,56 @@ def load_model_for_finetuning(
         device: Device mapping
         use_lora: Whether to use LoRA
         lora_config: LoRA configuration
-        use_quantization: Whether to use quantization
-        quantization_config: Quantization configuration
+        use_quantization: Whether to use quantization (QLoRA)
+        quantization_config: Quantization configuration dict
         torch_dtype: Data type
         trust_remote_code: Trust remote code
     
     Returns:
-        Model (possibly with LoRA applied)
+        Model (possibly with LoRA/QLoRA applied)
     """
-    # Load base model
     model_kwargs = {
         "torch_dtype": torch_dtype,
         "device_map": device,
         "trust_remote_code": trust_remote_code,
     }
     
-    if use_quantization and quantization_config:
-        model_kwargs["quantization_config"] = quantization_config
+    if use_quantization:
+        compute_dtype = torch.bfloat16 if (quantization_config or {}).get("bnb_4bit_compute_dtype", "bfloat16") == "bfloat16" else torch.float16
+        qconfig = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+        model_kwargs["quantization_config"] = qconfig
     
     model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
     
-    # Apply LoRA
+    if use_quantization and use_lora:
+        model = prepare_model_for_kbit_training(model)
+    
     if use_lora:
         if lora_config is None:
-            lora_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                r=16,
-                lora_alpha=32,
-                lora_dropout=0.05,
-                target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-                bias="none",
-                inference_mode=False,
-            )
+            target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
+            r, alpha, dropout = 16, 32, 0.05
+        else:
+            target_modules = lora_config.get("target_modules", ["q_proj", "v_proj", "k_proj", "o_proj"])
+            r = lora_config.get("r", 16)
+            alpha = lora_config.get("lora_alpha", 32)
+            dropout = lora_config.get("lora_dropout", 0.05)
         
-        model = get_peft_model(model, lora_config)
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            target_modules=target_modules,
+            bias="none",
+            inference_mode=False,
+        )
+        
+        model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
     
     return model
